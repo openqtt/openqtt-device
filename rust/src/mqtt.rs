@@ -9,7 +9,7 @@ use rumqttc::tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
 };
 use rumqttc::tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use rumqttc::{Event, EventLoop, MqttOptions, Packet, TlsConfiguration, Transport};
+use rumqttc::{Event, EventLoop, MqttOptions, Outgoing, Packet, TlsConfiguration, Transport};
 use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
@@ -20,6 +20,35 @@ use crate::error::{Error, Result};
 /// logged. Matching the broker means the only thing that can refuse a publish
 /// is the broker.
 pub const MAX_PACKET: usize = 1024 * 1024;
+
+/// What the broker prepends. Counted here because the packet the LISTENER
+/// measures is the mounted one, not the one this device wrote.
+const MOUNT_PREFIX: &str = "ingest/";
+
+/// How large the PUBLISH will be by the time the broker measures it.
+///
+/// Three things the payload length on its own leaves out: the two bytes of
+/// topic length and two of packet identifier in the variable header, the one to
+/// four bytes of the fixed header, and the mountpoint, which makes the topic
+/// the broker sees longer than the one that was passed in.
+pub fn packet_size(topic: &str, common_name: usize, payload: usize) -> usize {
+    let mounted = MOUNT_PREFIX.len() + common_name + 1 + topic.len();
+    // 2 for the topic length, 2 for the packet identifier at QoS 1 and 2.
+    let remaining = 2 + mounted + 2 + payload;
+    1 + remaining_length_bytes(remaining) + remaining
+}
+
+/// MQTT encodes the remaining length in one to four bytes, seven bits at a
+/// time. Worth the four lines: at the 1 MB boundary it is 4, and rounding it to
+/// 1 would put the check on the wrong side of the line.
+fn remaining_length_bytes(remaining: usize) -> usize {
+    match remaining {
+        0..=127 => 1,
+        128..=16_383 => 2,
+        16_384..=2_097_151 => 3,
+        _ => 4,
+    }
+}
 
 /// 30 seconds, and 5 is the number this is not.
 ///
@@ -76,15 +105,30 @@ pub fn chain_root(chain_pem: &str) -> Result<CertificateDer<'static>> {
 /// ```
 ///
 /// The broker sends the intermediate itself, so the root alone is enough.
+///
+/// THE PIN IS CHECKED HERE AND NOT AT ENROLLMENT, and moving it was a bug fix
+/// rather than tidying. The check used to run on the enrollment response,
+/// before the response was persisted. But the api rotates the token on every
+/// success, so by the time the check ran the response was already a spent
+/// credential: a device with a stale pin enrolled, refused its own new token,
+/// retried on the one-rotation grace, refused that too, and was locked out of
+/// the platform for good. Checking the STORED chain, at connect time, costs
+/// nothing, repeats until somebody fixes it, and can never consume a token.
 pub fn client_config(
-    root: CertificateDer<'static>,
+    pin: &crate::Pin,
     certificate_pem: &str,
     chain_pem: &str,
     private_key_pem: &str,
 ) -> Result<ClientConfig> {
+    if chain_root(chain_pem)? != pin.certificate {
+        return Err(Error::RootMismatch {
+            root: pin.path.clone(),
+        });
+    }
+
     let mut roots = RootCertStore::empty();
     roots
-        .add(root)
+        .add(pin.certificate.clone())
         .map_err(|error| Error::Crypto(format!("the root certificate is unusable: {error}")))?;
 
     // LEAF FIRST, THEN THE CHAIN. TLS wants the path in order from the end
@@ -169,12 +213,13 @@ pub fn check_topic(topic: &str) -> Result<()> {
         ));
     }
     // `max_topic_levels` is 128 on the listener, and the mountpoint spends
-    // three of them before this topic starts.
+    // FOUR of them before this topic starts: `ingest` plus the three the common
+    // name is made of, `<organization>/<namespace>/<device>`.
     let levels = topic.split('/').count();
-    if levels > 125 {
+    if levels > 124 {
         return Err(Error::Topic(format!(
             "'{topic}' has {levels} levels. The broker allows 128 and the \
-             mountpoint uses three of them."
+             mountpoint uses four of them."
         )));
     }
     Ok(())
@@ -195,9 +240,14 @@ pub fn check_topic(topic: &str) -> Result<()> {
 /// the flag every device logs a connection error at WARN once a day, for the
 /// most routine thing it does, and a log that cries wolf daily is one nobody
 /// reads on the day it matters.
+/// `flushed` fires when this loop has actually put a DISCONNECT on the wire.
+/// That is the signal a handover waits on, and it is a real one rather than a
+/// guess at how long writing takes: rumqttc drains its request queue in order,
+/// so the DISCONNECT leaving means everything queued before it left too.
 pub async fn pump(
     mut eventloop: EventLoop,
     mut ready: Option<oneshot::Sender<()>>,
+    mut flushed: Option<oneshot::Sender<()>>,
     retiring: Arc<AtomicBool>,
 ) {
     loop {
@@ -205,6 +255,12 @@ pub async fn pump(
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 tracing::info!("connected to the broker");
                 if let Some(sender) = ready.take() {
+                    let _ = sender.send(());
+                }
+            }
+            Ok(Event::Outgoing(Outgoing::Disconnect)) => {
+                tracing::debug!("disconnect sent; everything queued before it has gone out");
+                if let Some(sender) = flushed.take() {
                     let _ = sender.send(());
                 }
             }

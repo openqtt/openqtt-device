@@ -20,13 +20,26 @@ use rand::Rng as _;
 use rumqttc::tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, Retry};
 
-/// Ceiling on the backoff. Chosen against the certificate lifetime, not out of
-/// taste: 7 days of validity with a renewal due after 1 leaves 6 days of slack,
-/// so a device retrying every 15 minutes gets roughly 570 attempts before
-/// anything stops working.
-pub const BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
+/// Ceiling for something that is probably about to fix itself. Chosen against
+/// the certificate lifetime, not out of taste: 7 days of validity with a
+/// renewal due after 1 leaves 6 days of slack, so a device retrying every 15
+/// minutes gets roughly 570 attempts before anything stops working.
+pub const FAST_CAP: Duration = Duration::from_secs(15 * 60);
+
+/// Ceiling for a credential the platform has rejected.
+///
+/// SIZED BY THE FLEET AND NOT BY THIS DEVICE. Everything behind the ingress
+/// shares one bucket of 60 requests a minute. Full jitter means a device
+/// averages one attempt per half-cap, so at 15 minutes a dead device costs 8
+/// requests an hour and about 450 of them consume the whole bucket, which is a
+/// handful of decommissioned machines stopping every healthy device from
+/// renewing. At 6 hours it is 4 a day, and it takes something on the order of
+/// ten thousand before the arithmetic matters. A device re-enabled in the
+/// console still recovers on its own, which is the property being protected.
+pub const SLOW_CAP: Duration = Duration::from_secs(6 * 60 * 60);
+
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Serialize)]
@@ -71,10 +84,6 @@ impl Client {
             http,
             url: url.into(),
         })
-    }
-
-    pub fn url(&self) -> &str {
-        &self.url
     }
 
     /// One attempt. The retrying lives in the callers, because a first
@@ -162,10 +171,16 @@ fn message_from(body: &str, fallback: &str) -> String {
 /// every device in the fleet shares one bucket. A fleet retrying on a fixed
 /// interval synchronises itself into a permanent 429 and the outage is entirely
 /// self-inflicted.
-pub fn backoff(attempt: u32) -> Duration {
+/// `pace` picks the ceiling: see [`Retry`] for why a rejected credential backs
+/// off on a different scale from a flat network.
+pub fn backoff(attempt: u32, pace: Retry) -> Duration {
+    let cap = match pace {
+        Retry::Soon => FAST_CAP,
+        Retry::Rarely => SLOW_CAP,
+    };
     let ceiling = BACKOFF_BASE
         .saturating_mul(1u32 << attempt.min(20))
-        .min(BACKOFF_CAP);
+        .min(cap);
     let millis = rand::rng().random_range(0..=ceiling.as_millis() as u64);
     Duration::from_millis(millis)
 }
@@ -257,8 +272,9 @@ mod tests {
         assert!(matches!(error, Error::Refused));
         // A working device that lost its credential keeps trying, because a
         // person can put it back. A first enrollment stops, because a person
-        // is watching.
-        assert!(error.transient());
+        // is watching. And it keeps trying SLOWLY, because a fleet of dead
+        // devices asking quickly is what empties the shared rate-limit bucket.
+        assert_eq!(error.retry(), Retry::Rarely);
         assert!(error.fatal_at_bootstrap());
     }
 
@@ -270,7 +286,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Disabled));
-        assert!(error.transient(), "re-enabling must not need a site visit");
+        assert_eq!(
+            error.retry(),
+            Retry::Rarely,
+            "re-enabling must not need a site visit, but it must not cost the fleet either"
+        );
     }
 
     #[tokio::test]
@@ -285,7 +305,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("P-256"), "{error}");
-        assert!(!error.transient(), "retrying will not change the curve");
+        assert_eq!(
+            error.retry(),
+            Retry::Rarely,
+            "retrying quickly will not change the curve"
+        );
     }
 
     #[tokio::test]
@@ -298,7 +322,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::RateLimited));
-        assert!(error.transient());
+        assert_eq!(error.retry(), Retry::Soon);
     }
 
     #[tokio::test]
@@ -309,7 +333,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Api { status: 500, .. }), "{error}");
-        assert!(error.transient());
+        assert_eq!(error.retry(), Retry::Soon);
     }
 
     #[tokio::test]
@@ -321,22 +345,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Transport { .. }), "{error}");
-        assert!(error.transient());
+        assert_eq!(error.retry(), Retry::Soon);
         assert!(!error.fatal_at_bootstrap());
     }
 
     #[test]
-    fn backoff_never_exceeds_the_cap() {
+    fn neither_pace_ever_exceeds_its_cap() {
         for attempt in 0..64 {
-            assert!(backoff(attempt) <= BACKOFF_CAP);
+            assert!(backoff(attempt, Retry::Soon) <= FAST_CAP);
+            assert!(backoff(attempt, Retry::Rarely) <= SLOW_CAP);
         }
+    }
+
+    #[test]
+    fn a_rejected_credential_backs_off_on_a_different_scale() {
+        // The whole point of the second cap: a fleet of dead devices must not
+        // be able to consume the bucket every healthy device renews through.
+        // Sampled rather than asserted once, because full jitter means any
+        // single draw can be small.
+        let far: Duration = (0..200).map(|_| backoff(30, Retry::Rarely)).max().unwrap();
+        let near: Duration = (0..200).map(|_| backoff(30, Retry::Soon)).max().unwrap();
+        assert!(far > FAST_CAP, "the slow pace must reach past the fast cap");
+        assert!(near <= FAST_CAP);
     }
 
     #[test]
     fn backoff_is_jittered_rather_than_a_schedule() {
         // The point of full jitter is that a fleet does not agree on when to
         // come back. Two draws at the same attempt should differ.
-        let draws: Vec<_> = (0..16).map(|_| backoff(12)).collect();
+        let draws: Vec<_> = (0..16).map(|_| backoff(12, Retry::Soon)).collect();
         assert!(draws.iter().any(|value| *value != draws[0]));
     }
 

@@ -44,6 +44,16 @@ pub struct State {
     pub next_token: String,
     pub not_after: DateTime<Utc>,
     pub renew_after: DateTime<Utc>,
+    /// The api's own clock at the moment this certificate was issued.
+    ///
+    /// KEPT SO A WRONG CLOCK IS DETECTABLE AND NOT MERELY SURVIVABLE. The
+    /// renewal schedule already ignores the local clock, but startup cannot:
+    /// deciding whether a stored certificate is still usable means comparing
+    /// `not_after` against something. A device whose clock reads earlier than
+    /// the instant its own certificate was issued is holding proof that its
+    /// clock is wrong, and that is the one comparison that needs no trusted
+    /// source. See `lib::establish`.
+    pub issued_at: DateTime<Utc>,
 }
 
 pub struct Store {
@@ -109,10 +119,12 @@ impl Store {
 
         fs::rename(&temporary, &self.path).map_err(|error| io(&self.path, error))?;
 
-        // The rename is a directory operation and needs its own flush.
-        if let Ok(handle) = fs::File::open(directory) {
-            let _ = handle.sync_all();
-        }
+        // The rename is a directory operation and needs its own flush, and
+        // BOTH HALVES ARE CHECKED. Swallowing them, as this did, means
+        // returning success while the durability this whole design rests on
+        // did not happen. If the claim cannot be made, say so instead.
+        let handle = fs::File::open(directory).map_err(|error| io(directory, error))?;
+        handle.sync_all().map_err(|error| io(directory, error))?;
         Ok(())
     }
 }
@@ -187,6 +199,7 @@ mod tests {
             next_token: token.to_string(),
             not_after: Utc::now() + chrono::TimeDelta::days(7),
             renew_after: Utc::now() + chrono::TimeDelta::days(1),
+            issued_at: Utc::now(),
         }
     }
 

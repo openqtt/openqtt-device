@@ -59,10 +59,7 @@ impl Config {
         Ok(Config {
             device: var("OPENQTT_DEVICE"),
             bootstrap_token: var("OPENQTT_TOKEN"),
-            api: var("OPENQTT_API")
-                .unwrap_or_else(|| DEFAULT_API.to_string())
-                .trim_end_matches('/')
-                .to_string(),
+            api: clean_api(&var("OPENQTT_API").unwrap_or_else(|| DEFAULT_API.to_string()))?,
             broker_host,
             broker_port,
             root_ca: var("OPENQTT_ROOT_CA")
@@ -91,6 +88,59 @@ fn var(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+/// The enrollment endpoint, refusing a scheme that would put the credential on
+/// the wire in clear.
+///
+/// THE TOKEN IS IN THE BODY AND IT ROTATES, which makes plain HTTP worse here
+/// than it looks. Anybody on the path reads both the credential this device is
+/// using and the one it is about to use, and the second of those is enough to
+/// enrol as this device and keep doing so after the real one has moved on.
+/// There is no warning that makes that acceptable, so it is refused rather
+/// than logged.
+///
+/// Loopback is exempt. A harness on the same machine has no wire to intercept,
+/// and refusing it would mean this crate could not be exercised end to end
+/// without standing up a certificate authority. Its own live test uses
+/// `http://127.0.0.1`.
+fn clean_api(raw: &str) -> Result<String> {
+    let api = raw.trim().trim_end_matches('/');
+    if api.is_empty() {
+        return Err(Error::Config("OPENQTT_API is empty.".to_string()));
+    }
+    if api.starts_with("https://") {
+        return Ok(api.to_string());
+    }
+    match api.strip_prefix("http://") {
+        Some(authority) if is_loopback(authority) => Ok(api.to_string()),
+        Some(_) => Err(Error::Config(format!(
+            "OPENQTT_API is '{api}', which is not encrypted. The enrollment token \
+             travels in the body and rotates on every use, so anybody on the path \
+             reads both the credential this device is using and the one it is about \
+             to use. Use https, or a loopback address for a test."
+        ))),
+        None => Err(Error::Config(format!(
+            "OPENQTT_API is '{api}', which has no scheme. It looks like \
+             https://api.openqtt.com."
+        ))),
+    }
+}
+
+/// Whether an authority names this machine. Handles `host`, `host:port` and
+/// `[::1]:port`, and stops at the first `/` so a path cannot smuggle a name in.
+fn is_loopback(authority: &str) -> bool {
+    let authority = authority.split('/').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// `host`, `host:port`, `[::1]:port`, optionally prefixed `mqtts://`.
@@ -185,5 +235,54 @@ mod tests {
     #[test]
     fn a_port_that_is_not_a_number_is_an_error() {
         assert!(parse_broker("example.test:mqtt").is_err());
+    }
+
+    #[test]
+    fn https_is_kept_and_the_trailing_slash_is_not() {
+        assert_eq!(
+            clean_api("https://api.openqtt.com/").unwrap(),
+            "https://api.openqtt.com"
+        );
+    }
+
+    #[test]
+    fn plain_http_to_a_real_host_is_refused_and_says_why() {
+        let message = clean_api("http://api.openqtt.com").unwrap_err().to_string();
+        assert!(message.contains("not encrypted"), "{message}");
+        // The reason has to name what is actually lost, which is the NEXT
+        // token rather than only the current one.
+        assert!(message.contains("about to use"), "{message}");
+    }
+
+    #[test]
+    fn loopback_over_http_is_allowed_because_a_test_needs_it() {
+        for allowed in [
+            "http://127.0.0.1:8099",
+            "http://localhost:8099",
+            "http://LocalHost",
+            "http://[::1]:8099",
+        ] {
+            assert!(clean_api(allowed).is_ok(), "{allowed}");
+        }
+    }
+
+    #[test]
+    fn a_host_that_only_looks_like_loopback_is_still_refused() {
+        // The check stops at the first slash and at the port, so none of these
+        // reach the exemption.
+        for refused in [
+            "http://localhost.example.com",
+            "http://127.0.0.1.example.com",
+            "http://example.com/localhost",
+            "http://example.com/127.0.0.1",
+        ] {
+            assert!(clean_api(refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn an_api_with_no_scheme_is_refused_rather_than_guessed() {
+        let message = clean_api("api.openqtt.com").unwrap_err().to_string();
+        assert!(message.contains("no scheme"), "{message}");
     }
 }

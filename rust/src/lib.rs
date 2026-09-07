@@ -121,9 +121,14 @@ pub struct Device {
 impl Device {
     /// Read the environment, enrol if needed, connect, and start renewing.
     ///
-    /// Returns once the broker has acknowledged the connection, so a device
-    /// that is misconfigured fails while somebody is still watching rather than
-    /// running for a week publishing into nothing.
+    /// On a device's FIRST run this waits for the broker to acknowledge the
+    /// connection and fails if it does not, because somebody is watching and an
+    /// error is more use to them than a process that sits there. On every run
+    /// after that an unreachable broker is a warning: the device is returned
+    /// connecting, and both the connection and the renewal keep retrying in the
+    /// background. A device whose certificate has run out can only be repaired
+    /// by the renewal task, so refusing to return one would remove the only
+    /// thing able to fix it.
     pub async fn connect() -> Result<Device> {
         Device::with_config(Config::from_env()?).await
     }
@@ -134,31 +139,51 @@ impl Device {
         let pin = read_pin(&config.root_ca)?;
         let api = enroll::Client::new(config.enroll_url())?;
 
-        let (current, wait) = establish(&api, &store, &pin, &config).await?;
+        let Established {
+            current,
+            wait,
+            first,
+        } = establish(&api, &store, &config).await?;
 
         let (client, eventloop) = build_client(&current, &pin, &config)?;
         let (ready, connected) = oneshot::channel();
         let pump = Connection::spawn(eventloop, ready);
-        let acknowledged = tokio::time::timeout(config.connect_timeout, connected).await;
-        if acknowledged.is_err() || acknowledged.is_ok_and(|inner| inner.is_err()) {
-            return Err(Error::Timeout {
-                doing: "waiting for the broker to acknowledge the connection",
-                seconds: config.connect_timeout.as_secs(),
-            });
-        }
 
         let common_name = current.common_name.clone();
         let cell = Arc::new(ArcSwap::from_pointee(client));
 
+        // RENEWAL STARTS BEFORE THE CONNECTION IS WAITED FOR, and the order is
+        // a fix rather than a tidy-up. It used to start afterwards, so a device
+        // that could not reach the broker never renewed: the certificate ran
+        // out, which guaranteed it could not reach the broker, and every
+        // restart repeated the same minute. The two are independent and the one
+        // that heals the other has to run first.
         let (renewed, handovers) = mpsc::channel(1);
         let renewing = Abort(tokio::spawn(renew::task(
             enroll::Client::new(config.enroll_url())?,
             state::Store::new(&config.state),
-            pin.clone(),
             current,
             wait,
             renewed,
         )));
+
+        let acknowledged = tokio::time::timeout(config.connect_timeout, connected).await;
+        if acknowledged.is_err() || acknowledged.is_ok_and(|inner| inner.is_err()) {
+            let timeout = Error::Timeout {
+                doing: "waiting for the broker to acknowledge the connection",
+                seconds: config.connect_timeout.as_secs(),
+            };
+            // WHO IS WATCHING DECIDES WHETHER THIS IS FATAL. On a first
+            // enrollment somebody is at a terminal and an error is the useful
+            // answer. For a device that already had state this is a bad minute
+            // on a link, and returning an error would stop the renewal task
+            // that is the only thing able to fix a spent certificate.
+            if first {
+                return Err(timeout);
+            }
+            tracing::warn!(%timeout, "connecting anyway; the connection and the renewal both retry");
+        }
+
         let supervising = Abort(tokio::spawn(supervise(
             Arc::clone(&cell),
             store,
@@ -199,11 +224,19 @@ impl Device {
     ) -> Result<()> {
         mqtt::check_topic(topic)?;
         let payload = payload.into();
-        if payload.len() > mqtt::MAX_PACKET {
+        // THE LIMIT IS ON THE PACKET AND NOT ON THE PAYLOAD, so the topic and
+        // the header have to be counted too. Comparing the payload alone
+        // accepted a message a few bytes over the line and let the broker or
+        // the client refuse it later, which is the wrong place to find out.
+        // The topic the BROKER sees is longer still: the mountpoint prepends
+        // `ingest/<common name>/` before it is measured against the listener.
+        let packet = mqtt::packet_size(topic, self.common_name.len(), payload.len());
+        if packet > mqtt::MAX_PACKET {
             return Err(Error::Topic(format!(
-                "the payload is {} bytes and the broker accepts {}.",
-                payload.len(),
-                mqtt::MAX_PACKET
+                "this message is {packet} bytes once the topic and the header are \
+                 counted, and the broker accepts {}. The payload alone is {}.",
+                mqtt::MAX_PACKET,
+                payload.len()
             )));
         }
         // `load` and not a captured clone: this is the cell that makes a
@@ -251,18 +284,27 @@ impl Drop for Abort {
     }
 }
 
-/// One polling task, and the switch that tells it it is on its way out.
+/// One polling task, the switch that tells it it is on its way out, and the
+/// signal that says it has finished going.
 struct Connection {
     task: JoinHandle<()>,
     retiring: Arc<AtomicBool>,
+    flushed: Option<oneshot::Receiver<()>>,
 }
 
 impl Connection {
     fn spawn(eventloop: rumqttc::EventLoop, ready: oneshot::Sender<()>) -> Connection {
         let retiring = Arc::new(AtomicBool::new(false));
+        let (sent, flushed) = oneshot::channel();
         Connection {
-            task: tokio::spawn(mqtt::pump(eventloop, Some(ready), Arc::clone(&retiring))),
+            task: tokio::spawn(mqtt::pump(
+                eventloop,
+                Some(ready),
+                Some(sent),
+                Arc::clone(&retiring),
+            )),
             retiring,
+            flushed: Some(flushed),
         }
     }
 
@@ -270,6 +312,32 @@ impl Connection {
     /// reports the close it is about to be asked for.
     fn retire(&self) {
         self.retiring.store(true, Ordering::Relaxed);
+    }
+
+    /// Wait until the DISCONNECT has actually gone out, or the budget runs out.
+    ///
+    /// A REAL SIGNAL RATHER THAN A GUESS AT HOW LONG WRITING TAKES. This used to
+    /// be a flat 200ms sleep, which is a number somebody picked: anything still
+    /// queued when it elapsed was thrown away with the task. rumqttc drains its
+    /// request queue in order, so seeing the DISCONNECT leave means everything
+    /// queued ahead of it left too.
+    ///
+    /// What it still does not promise is delivery. A QoS 1 publish waiting on
+    /// its PUBACK when the handover starts is lost, because `clean_session` is
+    /// true and the replacement client shares no packet-id state with this one.
+    /// Closing that would mean a persistent session, which brings back the
+    /// unsolicited-puback reconnect loop `mqtt::options` exists to avoid.
+    async fn drain(&mut self, budget: Duration) {
+        let Some(flushed) = self.flushed.take() else {
+            return;
+        };
+        if tokio::time::timeout(budget, flushed).await.is_err() {
+            tracing::warn!(
+                seconds = budget.as_secs(),
+                "the outgoing connection did not report its disconnect in time; \
+                 anything still queued on it is being dropped"
+            );
+        }
     }
 
     /// Stop the task now. Idempotent, and `Drop` does the same, so calling it
@@ -293,12 +361,19 @@ impl Drop for Connection {
 /// rather than this crate's: a device that has never enrolled and a device
 /// whose certificate expired eleven months ago send the same request to the
 /// same route with the same kind of credential.
+struct Established {
+    current: state::State,
+    wait: Duration,
+    /// Whether this device had never enrolled before. The only thing it decides
+    /// is whether a broker that does not answer is fatal: see `with_config`.
+    first: bool,
+}
+
 async fn establish(
     api: &enroll::Client,
     store: &state::Store,
-    pin: &Pin,
     config: &Config,
-) -> Result<(state::State, Duration)> {
+) -> Result<Established> {
     let stored = store.load()?;
 
     if let (Some(held), Some(configured)) = (&stored, &config.device) {
@@ -314,11 +389,11 @@ async fn establish(
     }
 
     match stored {
-        // Usable. Note that the schedule here is the one place a local clock
-        // enters at all, because a stored instant is all there is until the
-        // next response arrives. It errs safe: a clock that reads late renews
-        // early, which costs one request.
-        Some(held) if held.not_after > Utc::now() + STARTUP_MARGIN => {
+        Some(held) if usable(&held) => {
+            // The schedule here is the one place a local clock is consulted at
+            // all, because a stored instant is all there is until the next
+            // response arrives. It errs safe: a clock reading late renews early,
+            // which costs one request.
             let wait = renew::next_wake(
                 Utc::now(),
                 held.renew_after,
@@ -330,28 +405,61 @@ async fn establish(
                 not_after = %held.not_after,
                 "using the stored certificate"
             );
-            Ok((held, wait))
+            Ok(Established {
+                current: held,
+                wait,
+                first: false,
+            })
         }
-        // Expired, or close enough that connecting first would just fail. The
+        // Spent, or held by a device whose clock cannot be trusted to say. The
         // token is what proves this device, and the token does not expire.
         Some(held) => {
             tracing::info!(
                 common_name = %held.common_name,
                 not_after = %held.not_after,
-                "the stored certificate is spent; enrolling before connecting"
+                "the stored certificate cannot be relied on; enrolling before connecting"
             );
-            renew::renew(api, store, pin, &held).await
+            let (current, wait) = renew::renew(api, store, &held).await?;
+            Ok(Established {
+                current,
+                wait,
+                first: false,
+            })
         }
-        None => first_enrollment(api, store, pin, config).await,
+        None => first_enrollment(api, store, config).await,
     }
+}
+
+/// Whether a stored certificate can be connected with.
+///
+/// TWO QUESTIONS, AND THE SECOND IS ABOUT THE CLOCK RATHER THAN THE
+/// CERTIFICATE. Comparing `not_after` against `Utc::now()` is only meaningful
+/// if `Utc::now()` means anything, and on a device with no real time clock it
+/// often does not. A clock reading BEFORE the moment the api issued this very
+/// certificate is proof of that, needing no trusted source to establish: the
+/// certificate exists, so its issuing instant has passed. Without this check a
+/// device that booted thinking it was 1970 would see a far-future `not_after`,
+/// declare a long-expired certificate healthy, fail the handshake with
+/// something unhelpful, and do it again on every restart forever.
+fn usable(held: &state::State) -> bool {
+    let now = Utc::now();
+    if now < held.issued_at {
+        tracing::warn!(
+            issued_at = %held.issued_at,
+            local_time = %now,
+            "this device's clock reads earlier than its own certificate was issued, \
+             so it cannot judge what is expired; renewing to find out the time"
+        );
+        return false;
+    }
+    held.not_after > now + STARTUP_MARGIN
 }
 
 async fn first_enrollment(
     api: &enroll::Client,
     store: &state::Store,
-    pin: &Pin,
     config: &Config,
-) -> Result<(state::State, Duration)> {
+) -> Result<Established> {
     let device = config.device.as_deref().ok_or_else(|| {
         Error::Config(format!(
             "This device has no state at {} and OPENQTT_DEVICE is not set. Set \
@@ -377,7 +485,7 @@ async fn first_enrollment(
             // and lets the service manager bring it back.
             Err(error) if error.fatal_at_bootstrap() => return Err(error),
             Err(error) => {
-                let pause = enroll::backoff(attempt);
+                let pause = enroll::backoff(attempt, error.retry());
                 tracing::warn!(
                     %error,
                     seconds = pause.as_secs(),
@@ -390,7 +498,10 @@ async fn first_enrollment(
         }
     };
 
-    renew::check_root(&fresh, pin, api)?;
+    // NOTHING FALLIBLE BETWEEN THE 200 AND THE WRITE. The token has already
+    // rotated on the api's side, so anything that fails here and returns costs
+    // the one grace enrollment this device has in reserve. See `renew::renew`,
+    // where the same rule cost a device its entire ability to enrol.
     let held = state::State {
         common_name: fresh.common_name.clone(),
         certificate: fresh.certificate.clone(),
@@ -399,6 +510,7 @@ async fn first_enrollment(
         next_token: fresh.next_token.clone(),
         not_after: fresh.not_after,
         renew_after: fresh.renew_after,
+        issued_at: fresh.server_time,
     };
     store.save(&held)?;
     tracing::info!(common_name = %held.common_name, "enrolled");
@@ -409,7 +521,11 @@ async fn first_enrollment(
         fresh.not_after,
         renew::jitter(),
     );
-    Ok((held, wait))
+    Ok(Established {
+        current: held,
+        wait,
+        first: true,
+    })
 }
 
 /// Replace the live connection every time a renewal commits.
@@ -455,7 +571,10 @@ async fn supervise(
         // The old loop is still polling, which is what puts the DISCONNECT on
         // the wire. A clean DISCONNECT suppresses the last will, so the
         // platform sees a planned handover rather than a machine falling over.
-        tokio::time::sleep(DISCONNECT_GRACE).await;
+        // Waiting for the loop to SAY it went out, rather than sleeping a
+        // guessed interval, is what stops a queued publish being dropped with
+        // the task. See `Connection::drain`.
+        polling.drain(DISCONNECT_GRACE).await;
 
         // AND NOW STOP IT, BEFORE THE REPLACEMENT STARTS. rumqttc reconnects
         // on its own as long as something keeps polling, and this loop still
@@ -480,8 +599,11 @@ async fn supervise(
             tracing::info!("broker connection now using the renewed certificate");
         }
     }
-    // The channel closed, which means the `Device` is gone. Take the connection
-    // down with it rather than leaving a task publishing nothing forever.
+    // The channel closed. `renew::task` never returns for any other reason, so
+    // this means the `Device` itself is gone: take the connection down with it
+    // rather than leave a task publishing into nothing. That guarantee is the
+    // renewal loop's to keep, and when it did not keep it a non-transient
+    // renewal error killed a connection with days of certificate left.
     drop(polling);
 }
 
@@ -503,12 +625,7 @@ fn build_client(
     pin: &Pin,
     config: &Config,
 ) -> Result<(AsyncClient, rumqttc::EventLoop)> {
-    let tls = mqtt::client_config(
-        pin.certificate.clone(),
-        &held.certificate,
-        &held.chain,
-        &held.private_key,
-    )?;
+    let tls = mqtt::client_config(pin, &held.certificate, &held.chain, &held.private_key)?;
     let options = mqtt::options(
         &held.common_name,
         &config.broker_host,

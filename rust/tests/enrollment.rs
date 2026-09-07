@@ -16,6 +16,7 @@
 //! one up honestly. That leg is proven against the real thing: see
 //! `tests/live.rs`.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,7 +50,10 @@ struct Enrollment {
     /// What goes in `chain`. Its last certificate is what the device compares
     /// against its pin, so a different authority here is a mismatch.
     chain: Arc<Authority>,
-    token: &'static str,
+    /// A DIFFERENT TOKEN ON EVERY CALL, like the real api. It is what turns
+    /// "this run did not go back to the api" into something a test can assert
+    /// rather than hope for.
+    issued: AtomicUsize,
 }
 
 impl Respond for Enrollment {
@@ -64,9 +68,13 @@ impl Respond for Enrollment {
             "chain": self.chain.pem,
             "common_name": body["device"],
             "not_after": "2099-09-14T12:00:00Z",
-            "next_token": self.token,
+            "next_token": format!("oqe_{}", self.issued.fetch_add(1, Ordering::SeqCst) + 1),
             "renew_after": "2099-09-08T12:00:00Z",
-            "server_time": "2099-09-07T12:00:00Z"
+            // IN THE PAST, and it matters. This is the api's clock at issuance,
+            // and a device refuses to trust its own clock when it reads earlier
+            // than this. A fixture claiming to have issued the certificate in
+            // 2099 would make every device believe its clock was broken.
+            "server_time": "2020-01-01T00:00:00Z"
         }))
     }
 }
@@ -91,7 +99,7 @@ async fn fixture(pinned: Arc<Authority>, chain: Arc<Authority>) -> Fixture {
         .respond_with(Enrollment {
             signing: Arc::clone(&pinned),
             chain,
-            token: "oqe_second",
+            issued: AtomicUsize::new(0),
         })
         .mount(&server)
         .await;
@@ -133,7 +141,7 @@ async fn a_bare_device_enrols_and_keeps_what_it_was_given() {
     // THE TOKEN THAT CAME BACK, not the one that was used. The one it used
     // survives exactly one more rotation, so a device that kept the bootstrap
     // token would be one interruption away from being locked out.
-    assert_eq!(held["next_token"], "oqe_second");
+    assert_eq!(held["next_token"], "oqe_1");
     assert!(held["certificate"]
         .as_str()
         .unwrap()
@@ -166,26 +174,83 @@ async fn the_second_run_uses_what_the_first_one_stored() {
     let mut second = fixture.config.clone();
     second.bootstrap_token = None;
     second.device = None;
-    let error = Device::with_config(second).await.unwrap_err();
-    assert!(matches!(error, Error::Timeout { .. }), "{error}");
+
+    // The broker is still not there, and for a device that ALREADY HAS STATE
+    // that is deliberately no longer fatal. The renewal task is the only thing
+    // that can replace a spent certificate, and it lives on the `Device`, so
+    // returning an error here used to stop the one process able to heal the
+    // device and every restart repeated the same failure forever.
+    let device = Device::with_config(second)
+        .await
+        .expect("a device that has enrolled before keeps going without the broker");
+    assert_eq!(device.common_name(), "acme/production/pump-3");
 
     // Nothing was re-enrolled: the stored certificate is good until 2099.
     assert_eq!(std::fs::read_to_string(&state).unwrap(), first);
 }
 
 #[tokio::test]
-async fn a_chain_that_does_not_end_at_the_pin_is_refused_before_anything_is_kept() {
-    // The pin and the platform have moved apart. Saying so here, with both
-    // names in the message, beats an UnknownIssuer handshake failure a week
-    // later that names neither.
+async fn a_stale_pin_is_reported_without_ever_costing_a_token() {
+    // THE REGRESSION TEST FOR THE WORST BUG THIS CRATE HAS HAD.
+    //
+    // The root check used to run on the enrollment response, before that
+    // response was written down. The api rotates the token on every success, so
+    // refusing the response discarded a credential the platform had already
+    // moved on to. Twice in a row and the device was locked out permanently,
+    // with no field action able to recover it, because the one grace enrollment
+    // it held in reserve was spent on the second attempt.
     let fixture = fixture(Authority::new(), Authority::new()).await;
     let state = fixture.config.state.clone();
 
-    let error = Device::with_config(fixture.config).await.unwrap_err();
+    let error = Device::with_config(fixture.config.clone())
+        .await
+        .unwrap_err();
     assert!(matches!(error, Error::RootMismatch { .. }), "{error}");
-    assert!(
-        !state.exists(),
-        "nothing is committed when the pin disagrees"
+
+    // The response was kept. That is the whole fix: the device still holds a
+    // credential the platform will accept.
+    let first: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(first["next_token"], "oqe_1");
+
+    // And the complaint now repeats for free. The second run holds a
+    // certificate it believes in until 2099, so it never reaches the api: the
+    // mock mints a different token on every call, so an unchanged one proves no
+    // call was made and no grace was spent.
+    let again = Device::with_config(fixture.config).await.unwrap_err();
+    assert!(matches!(again, Error::RootMismatch { .. }), "{again}");
+    let second: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(second["next_token"], first["next_token"]);
+}
+
+#[tokio::test]
+async fn a_clock_behind_its_own_certificate_renews_instead_of_trusting_it() {
+    // A device with no real time clock boots at the epoch. `not_after` then
+    // reads as far in the future, so a spent certificate looks healthy, the
+    // handshake fails saying nothing useful, and the next restart does the same
+    // thing. `issued_at` settles it with no trusted source: this certificate
+    // exists, so the instant it was issued has already passed.
+    let authority = Authority::new();
+    let fixture = fixture(Arc::clone(&authority), authority).await;
+    let state = fixture.config.state.clone();
+
+    let _ = Device::with_config(fixture.config.clone()).await;
+    let mut held: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(held["next_token"], "oqe_1");
+
+    // The same file, now claiming to have been issued long after this machine
+    // believes it is. The certificate is untouched and still says 2099.
+    held["issued_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+    std::fs::write(&state, serde_json::to_string_pretty(&held).unwrap()).unwrap();
+
+    let _ = Device::with_config(fixture.config).await;
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(
+        after["next_token"], "oqe_2",
+        "it should have gone back to the api rather than trusted its own clock"
     );
 }
 

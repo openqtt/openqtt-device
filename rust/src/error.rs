@@ -85,12 +85,11 @@ pub enum Error {
     /// was given. See `Device::connect`: an equality check, not a trust
     /// decision.
     #[error(
-        "the certificate chain from {api} does not end at the root in {root}. \
-         One of the two is stale; the device will not connect until they agree"
+        "the stored certificate chain does not end at the root in {root}. \
+         One of the two is stale, and this device cannot check the broker \
+         until they agree"
     )]
     RootMismatch {
-        /// The enrollment endpoint that served the chain.
-        api: String,
         /// The pinned root this device was given.
         root: PathBuf,
     },
@@ -118,39 +117,55 @@ pub enum Error {
     },
 }
 
-impl Error {
-    /// Whether waiting and trying again could plausibly succeed.
+/// How soon a failed renewal should be tried again.
+///
+/// EVERYTHING IS RETRIED AND ONLY THE PACE DIFFERS, which is what lets the
+/// renewal loop run forever. A loop that can exit has to tell the rest of the
+/// program that it did, and getting that wrong took a working connection down
+/// with it once already: see `lib::supervise`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// Something outside this device is having a moment: a flat network, a
+    /// rate limit, a bad minute on the platform. Come back quickly.
+    Soon,
+    /// The platform has looked at this device's credential and said no, or
+    /// something here is broken in a way that waiting does not fix. A person
+    /// has to act.
     ///
-    /// `Refused` and `Disabled` are deliberately transient. Both describe a
+    /// SLOWLY, AND THE REASON IS THE FLEET RATHER THAN THIS DEVICE. The api's
+    /// rate limiter counts the address it sees, which is the ingress and not
+    /// the device, so every device shares one bucket of 60 requests a minute.
+    /// At the fast cap a dead device asks 8 times an hour and about 450 of them
+    /// saturate it, which would mean a handful of decommissioned machines
+    /// quietly stopping every healthy device from renewing.
+    Rarely,
+}
+
+impl Error {
+    /// How soon to try again. There is no "never": see [`Retry`].
+    ///
+    /// `Refused` and `Disabled` are deliberately retried. Both describe a
     /// record on the platform that a person can change, and a device that gave
     /// up on the first 403 would need a site visit after somebody re-enabled it
-    /// in the console. What stops that becoming an infinite hot loop is the
-    /// backoff cap, not the classification.
-    pub fn transient(&self) -> bool {
+    /// in the console.
+    pub fn retry(&self) -> Retry {
         match self {
-            Error::RateLimited | Error::Transport { .. } | Error::Timeout { .. } => true,
-            Error::Refused | Error::Disabled => true,
-            Error::Api { status, .. } => *status >= 500,
-            Error::Config(_)
-            | Error::Io { .. }
-            | Error::State { .. }
-            | Error::Rejected(_)
-            | Error::RootMismatch { .. }
-            | Error::Crypto(_)
-            | Error::Topic(_)
-            | Error::Mqtt(_) => false,
+            Error::RateLimited | Error::Transport { .. } | Error::Timeout { .. } => Retry::Soon,
+            Error::Api { status, .. } if *status >= 500 => Retry::Soon,
+            _ => Retry::Rarely,
         }
     }
 
     /// Whether a FIRST enrollment should stop rather than keep trying.
     ///
-    /// Different from `transient` on purpose. A 401 during renewal means a
-    /// working device lost its credential and should keep trying; a 401 on the
-    /// very first enrollment means somebody typed the token wrong, and a
-    /// process that hangs forever on that is worse than one that exits and
-    /// lets `Restart=always` bring it back.
+    /// Different from [`Error::retry`] on purpose, and the difference is who is
+    /// watching. A 401 during renewal means a working device lost its
+    /// credential and should keep asking, because somebody may put it back. A
+    /// 401 on the very first enrollment means somebody has just typed the token
+    /// wrong and is looking at the screen, and a process that hangs forever is
+    /// worse than one that exits and lets `Restart=always` bring it back.
     pub fn fatal_at_bootstrap(&self) -> bool {
-        matches!(self, Error::Refused | Error::Disabled) || !self.transient()
+        !matches!(self.retry(), Retry::Soon)
     }
 }
 

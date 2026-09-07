@@ -82,14 +82,21 @@ purpose.
 | `OPENQTT_TOKEN` | | the enrollment token. First run only |
 | `OPENQTT_ROOT_CA` | `/etc/openqtt/root.pem` | the one trusted certificate |
 | `OPENQTT_STATE` | `/etc/openqtt/state.json` | key, certificate and rotating token |
-| `OPENQTT_API` | `https://api.openqtt.com` | |
-| `OPENQTT_BROKER` | `mqtt.broker-yyz.openqtt.com:8883` | |
+| `OPENQTT_API` | `https://api.openqtt.com` | must be `https`, or a loopback address |
+| `OPENQTT_BROKER` | `mqtt.broker-yyz.openqtt.com:8883` | must not be `mqtt://` |
 | `OPENQTT_CONNECT_TIMEOUT` | `30` | seconds to wait for the first connection |
 
 Nothing is read from a config file, deliberately. A file that fails to parse
 and a file that is not there are hard to tell apart, and a device that quietly
 runs on defaults because of a stray comma is worse than one that refuses to
 start.
+
+Both endpoints refuse to be unencrypted, and neither refusal is pedantry. The
+enrollment token travels in the request body and rotates on every use, so plain
+HTTP hands anybody on the path both the credential the device is using and the
+one it is about to use, which is enough to enrol as that device and keep doing
+so. Loopback is the one exemption, because a test on the same machine has no
+wire to intercept.
 
 ## Two things that surprise everybody
 
@@ -117,6 +124,15 @@ of the enrollment response, and the result is slept on the monotonic timer. A
 device that thinks it is 1990 still renews on time. If its clock is far enough
 out to matter, the log says so, because that is also the explanation for a TLS
 handshake that otherwise fails for no visible reason.
+
+Startup is the one place a stored instant has to be compared against something,
+and the comparison is chosen so a broken clock cannot poison it: alongside the
+certificate the device keeps `issued_at`, the platform's own clock at the moment
+that certificate was signed. A device reading earlier than that is holding proof
+its clock is wrong, because the certificate exists and so its issuing moment has
+passed. It renews rather than believe itself. Without that check a device
+booting at the epoch reads a far-future expiry, calls a long-dead certificate
+healthy, and repeats the same failed handshake on every restart forever.
 
 **Renewals are spread.** The api's rate limiter counts the address it sees,
 which is the ingress and not the device, so a whole fleet shares one bucket of
