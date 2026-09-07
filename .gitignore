@@ -1,0 +1,12 @@
+# Rust
+target/
+
+# Anything that looks like a credential or device state. The crate writes
+# state.json with a private key inside it; a stray copy in the tree is the
+# easiest way for one to reach a public repository.
+*.pem
+*.key
+state.json
+state.json.new
+
+.DS_Store
