@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use openqtt_device::{Config, Device, Error};
+use openqtt_device::{BrokerTransport, Config, Device, Error};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -132,6 +132,7 @@ async fn fixture(pinned: Arc<Authority>, chain: Arc<Authority>) -> Fixture {
         // everything that happens before the broker.
         broker_host: "127.0.0.1".to_string(),
         broker_port: 1,
+        broker_transport: BrokerTransport::Tls,
         root_ca: root,
         state: home.path().join("openqtt").join("state.json"),
         connect_timeout: Duration::from_secs(1),
@@ -291,6 +292,7 @@ async fn a_wrong_token_on_a_first_run_stops_rather_than_retrying_forever() {
         api: server.uri(),
         broker_host: "127.0.0.1".to_string(),
         broker_port: 1,
+        broker_transport: BrokerTransport::Tls,
         root_ca: root,
         state: home.path().join("state.json"),
         connect_timeout: Duration::from_secs(1),
@@ -327,6 +329,7 @@ async fn a_missing_root_says_which_file_and_why() {
         api: "http://127.0.0.1:1".to_string(),
         broker_host: "127.0.0.1".to_string(),
         broker_port: 1,
+        broker_transport: BrokerTransport::Tls,
         root_ca: home.path().join("nowhere").join("root.pem"),
         state: home.path().join("state.json"),
         connect_timeout: Duration::from_secs(1),

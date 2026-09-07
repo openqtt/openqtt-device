@@ -83,7 +83,7 @@ purpose.
 | `OPENQTT_ROOT_CA` | `/etc/openqtt/root.pem` | the one trusted certificate |
 | `OPENQTT_STATE` | `/etc/openqtt/state.json` | key, certificate and rotating token |
 | `OPENQTT_API` | `https://api.openqtt.com` | must be `https`, or a loopback address |
-| `OPENQTT_BROKER` | `mqtt.broker-yyz.openqtt.com:8883` | must not be `mqtt://` |
+| `OPENQTT_BROKER` | `mqtt.broker-yyz.openqtt.com:8883` | `host:port`, `mqtts://...` or `wss://host:port/mqtt` |
 | `OPENQTT_CONNECT_TIMEOUT` | `30` | seconds to wait for the first connection |
 
 Nothing is read from a config file, deliberately. A file that fails to parse
@@ -97,6 +97,31 @@ HTTP hands anybody on the path both the credential the device is using and the
 one it is about to use, which is enough to enrol as that device and keep doing
 so. Loopback is the one exemption, because a test on the same machine has no
 wire to intercept.
+
+## TCP or WebSocket, and the namespace picks
+
+A namespace chooses one way its devices connect, and every device in it follows.
+
+```sh
+export OPENQTT_BROKER=mqtt.broker-yyz.openqtt.com:8883        # MQTT over TLS
+export OPENQTT_BROKER=wss://mqtt.broker-yyz.openqtt.com:8084/mqtt   # over a WebSocket
+```
+
+WebSocket exists for one reason: port 8883 is blocked on a great many industrial
+and corporate networks and 443-shaped traffic is not. It is slower to set up and
+one more thing to go wrong, so it is the answer when the first one cannot get
+out of the building, not before.
+
+**Nothing about identity changes.** Both carry the same mutual TLS and the
+broker takes the username from the client certificate either way. Verified
+against the production broker image: a device connected over `wss://` and its
+message arrived on `ingest/acme/production/pump-3/temperature`, the same place
+the TCP one lands.
+
+The path matters. `/mqtt` is the broker's own default and the upgrade request
+has to name a path the listener answers on. The port in a `wss://` URL is the
+one that is used; a WebSocket transport reads host and port out of the URL and
+ignores everything else.
 
 ## Two things that surprise everybody
 

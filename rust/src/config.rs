@@ -19,12 +19,39 @@ pub const DEFAULT_API: &str = "https://api.openqtt.com";
 pub const DEFAULT_BROKER: &str = "mqtt.broker-yyz.openqtt.com:8883";
 pub const DEFAULT_ROOT_CA: &str = "/etc/openqtt/root.pem";
 pub const DEFAULT_STATE: &str = "/etc/openqtt/state.json";
-const DEFAULT_PORT: u16 = 8883;
+const DEFAULT_TLS_PORT: u16 = 8883;
+const DEFAULT_WEBSOCKET_PORT: u16 = 8084;
+
+/// The broker's own default `websocket.mqtt_path`. It has to match or the
+/// upgrade request lands on a path the listener does not answer.
+const DEFAULT_WEBSOCKET_PATH: &str = "/mqtt";
 
 /// The listener gives a connection 15 seconds from TCP open to CONNECT, and a
 /// TLS handshake happens inside that. 30 covers a slow uplink and still fails
 /// while somebody is watching a first boot.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How this device reaches the broker.
+///
+/// ONE OR THE OTHER, CHOSEN BY THE NAMESPACE the device belongs to. Both carry
+/// the same mutual TLS and both end up with the same identity: the broker takes
+/// the username from the client certificate's common name either way, because
+/// `emqx_channel:init/2` reads one `peercert` field and does not know or care
+/// which listener filled it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerTransport {
+    /// MQTT straight over TLS, on 8883. The default, and the right answer
+    /// wherever the port is open.
+    Tls,
+    /// MQTT inside a WebSocket, on 8084. Slower to set up and one more thing to
+    /// go wrong, and the only way out of a site whose firewall passes nothing
+    /// but 443-shaped traffic. That is most industrial sites.
+    WebSocket {
+        /// The listener's `mqtt_path`. Sent in the upgrade request, so it has
+        /// to be the path the broker actually answers on.
+        path: String,
+    },
+}
 
 /// Where this device enrols, where it publishes, and what it keeps on disk.
 #[derive(Debug, Clone)]
@@ -41,6 +68,8 @@ pub struct Config {
     pub broker_host: String,
     /// The broker's TLS port.
     pub broker_port: u16,
+    /// Whether to speak MQTT directly or wrap it in a WebSocket.
+    pub broker_transport: BrokerTransport,
     /// The single certificate the broker connection is checked against.
     pub root_ca: PathBuf,
     /// Where the certificate, the key and the rotating token live.
@@ -55,13 +84,14 @@ impl Config {
     /// Read the six `OPENQTT_*` variables, filling in the hosted defaults.
     pub fn from_env() -> Result<Self> {
         let broker = var("OPENQTT_BROKER").unwrap_or_else(|| DEFAULT_BROKER.to_string());
-        let (broker_host, broker_port) = parse_broker(&broker)?;
+        let broker = parse_broker(&broker)?;
         Ok(Config {
             device: var("OPENQTT_DEVICE"),
             bootstrap_token: var("OPENQTT_TOKEN"),
             api: clean_api(&var("OPENQTT_API").unwrap_or_else(|| DEFAULT_API.to_string()))?,
-            broker_host,
-            broker_port,
+            broker_host: broker.host,
+            broker_port: broker.port,
+            broker_transport: broker.transport,
             root_ca: var("OPENQTT_ROOT_CA")
                 .unwrap_or_else(|| DEFAULT_ROOT_CA.to_string())
                 .into(),
@@ -153,25 +183,62 @@ fn is_loopback(authority: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-/// `host`, `host:port`, `[::1]:port`, optionally prefixed `mqtts://`.
+/// What `OPENQTT_BROKER` names, in each of the shapes it is allowed to take.
+#[derive(Debug, PartialEq, Eq)]
+struct Broker {
+    host: String,
+    port: u16,
+    transport: BrokerTransport,
+}
+
+/// `host`, `host:port`, `[::1]:port`, `mqtts://...`, or `wss://host:port/path`.
 ///
 /// Hand-rolled because the v5 gateway's `rfind(':')` turns `[::1]:8883` into
-/// host `[` and a parse error, and because refusing `mqtt://` here is the
-/// cheapest place to make plaintext impossible: v5's builder skips the whole
+/// host `[` and a parse error, and because refusing the plaintext schemes here
+/// is the cheapest place to make them impossible: v5's builder skips the whole
 /// TLS block when the CA is empty and connects unencrypted with no warning.
-fn parse_broker(raw: &str) -> Result<(String, u16)> {
-    if let Some(rest) = raw.strip_prefix("mqtt://") {
-        return Err(Error::Config(format!(
-            "OPENQTT_BROKER is mqtt://{rest}, which is plaintext. This device \
-             authenticates with a client certificate, so the connection is \
-             always TLS. Use mqtts:// or a bare host:port."
-        )));
+fn parse_broker(raw: &str) -> Result<Broker> {
+    let raw = raw.trim();
+    for plaintext in ["mqtt://", "ws://"] {
+        if let Some(rest) = raw.strip_prefix(plaintext) {
+            return Err(Error::Config(format!(
+                "OPENQTT_BROKER is {plaintext}{rest}, which is not encrypted. This \
+                 device authenticates with a client certificate, so the connection \
+                 is always TLS. Use mqtts:// or wss://, or a bare host:port."
+            )));
+        }
     }
-    let raw = raw
+
+    if let Some(rest) = raw.strip_prefix("wss://") {
+        // The path is part of the URL here and not an afterthought: rumqttc
+        // sends it as the upgrade request's target, and the broker only answers
+        // on its configured `mqtt_path`.
+        let (authority, path) = match rest.find('/') {
+            Some(at) => (&rest[..at], rest[at..].to_string()),
+            None => (rest, DEFAULT_WEBSOCKET_PATH.to_string()),
+        };
+        let (host, port) = split_authority(authority, DEFAULT_WEBSOCKET_PORT)?;
+        return Ok(Broker {
+            host,
+            port,
+            transport: BrokerTransport::WebSocket { path },
+        });
+    }
+
+    let authority = raw
         .strip_prefix("mqtts://")
         .unwrap_or(raw)
         .trim_end_matches('/');
-    if raw.is_empty() {
+    let (host, port) = split_authority(authority, DEFAULT_TLS_PORT)?;
+    Ok(Broker {
+        host,
+        port,
+        transport: BrokerTransport::Tls,
+    })
+}
+
+fn split_authority(authority: &str, default_port: u16) -> Result<(String, u16)> {
+    if authority.is_empty() {
         return Err(Error::Config("OPENQTT_BROKER is empty.".to_string()));
     }
 
@@ -181,19 +248,19 @@ fn parse_broker(raw: &str) -> Result<(String, u16)> {
         ))
     };
 
-    if let Some(rest) = raw.strip_prefix('[') {
+    if let Some(rest) = authority.strip_prefix('[') {
         let (host, tail) = rest.split_once(']').ok_or_else(|| {
             Error::Config("OPENQTT_BROKER opens a bracket it never closes.".to_string())
         })?;
         let port = match tail.strip_prefix(':') {
             Some(port) => port.parse().map_err(|_| bad_port(port))?,
-            None if tail.is_empty() => DEFAULT_PORT,
+            None if tail.is_empty() => default_port,
             None => return Err(bad_port(tail)),
         };
         return Ok((host.to_string(), port));
     }
 
-    match raw.rsplit_once(':') {
+    match authority.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') && !host.is_empty() => {
             Ok((host.to_string(), port.parse().map_err(|_| bad_port(port))?))
         }
@@ -201,9 +268,10 @@ fn parse_broker(raw: &str) -> Result<(String, u16)> {
         // rather than guess: the alternative is silently connecting to a host
         // named `::1` on port 8883, or to `::` on port 1.
         Some(_) => Err(Error::Config(format!(
-            "OPENQTT_BROKER is '{raw}'. Put an IPv6 address in brackets, as [{raw}]:{DEFAULT_PORT}."
+            "OPENQTT_BROKER is '{authority}'. Put an IPv6 address in brackets, \
+             as [{authority}]:{default_port}."
         ))),
-        None => Ok((raw.to_string(), DEFAULT_PORT)),
+        None => Ok((authority.to_string(), default_port)),
     }
 }
 
@@ -211,35 +279,70 @@ fn parse_broker(raw: &str) -> Result<(String, u16)> {
 mod tests {
     use super::*;
 
+    fn tls(host: &str, port: u16) -> Broker {
+        Broker {
+            host: host.to_string(),
+            port,
+            transport: BrokerTransport::Tls,
+        }
+    }
+
     #[test]
     fn broker_forms() {
         assert_eq!(
             parse_broker("mqtt.broker-yyz.openqtt.com").unwrap(),
-            ("mqtt.broker-yyz.openqtt.com".to_string(), 8883)
+            tls("mqtt.broker-yyz.openqtt.com", 8883)
         );
         assert_eq!(
             parse_broker("mqtts://example.test:1884").unwrap(),
-            ("example.test".to_string(), 1884)
+            tls("example.test", 1884)
         );
-        assert_eq!(
-            parse_broker("[::1]:1884").unwrap(),
-            ("::1".to_string(), 1884)
-        );
-        assert_eq!(parse_broker("[::1]").unwrap(), ("::1".to_string(), 8883));
+        assert_eq!(parse_broker("[::1]:1884").unwrap(), tls("::1", 1884));
+        assert_eq!(parse_broker("[::1]").unwrap(), tls("::1", 8883));
     }
 
     #[test]
-    fn plaintext_is_refused_by_name() {
-        let message = parse_broker("mqtt://example.test:1883")
-            .unwrap_err()
-            .to_string();
-        assert!(message.contains("plaintext"), "{message}");
+    fn a_websocket_broker_carries_its_own_port_and_path() {
+        assert_eq!(
+            parse_broker("wss://example.test").unwrap(),
+            Broker {
+                host: "example.test".to_string(),
+                // Not 8883: a WebSocket listener is a different listener.
+                port: 8084,
+                transport: BrokerTransport::WebSocket {
+                    // The broker's own default `mqtt_path`. Getting this wrong
+                    // means the upgrade lands on a path it does not answer.
+                    path: "/mqtt".to_string()
+                },
+            }
+        );
+        assert_eq!(
+            parse_broker("wss://example.test:443/somewhere").unwrap(),
+            Broker {
+                host: "example.test".to_string(),
+                port: 443,
+                transport: BrokerTransport::WebSocket {
+                    path: "/somewhere".to_string()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn both_plaintext_schemes_are_refused_by_name() {
+        // `ws://` is the trap that `mqtt://` is not: it looks like the secure
+        // one with two characters missing.
+        for plaintext in ["mqtt://example.test:1883", "ws://example.test:8083/mqtt"] {
+            let message = parse_broker(plaintext).unwrap_err().to_string();
+            assert!(message.contains("not encrypted"), "{plaintext}: {message}");
+        }
     }
 
     #[test]
     fn bare_ipv6_is_refused_rather_than_guessed() {
         // v5's rfind(':') would answer host "::" port 1 here, and connect.
         assert!(parse_broker("::1").is_err());
+        assert!(parse_broker("wss://::1/mqtt").is_err());
     }
 
     #[test]

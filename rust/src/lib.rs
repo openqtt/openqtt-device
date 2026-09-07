@@ -68,7 +68,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
-pub use crate::config::Config;
+pub use crate::config::{BrokerTransport, Config};
 pub use crate::error::{Error, Result};
 
 /// How long a handover waits for the replacement connection before giving up
@@ -706,6 +706,7 @@ fn build_client(
         &held.common_name,
         &config.broker_host,
         config.broker_port,
+        &config.broker_transport,
         tls,
     );
     Ok(AsyncClient::new(options, REQUEST_QUEUE))
