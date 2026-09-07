@@ -12,6 +12,7 @@ use rumqttc::tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use rumqttc::{Event, EventLoop, MqttOptions, Outgoing, Packet, QoS, TlsConfiguration, Transport};
 use tokio::sync::{oneshot, Notify};
 
+use crate::config::BrokerTransport;
 use crate::error::{Error, Result};
 
 /// The broker's own ceiling (`emqx_schema.erl`, `max_packet_size`). rumqttc
@@ -152,13 +153,29 @@ pub fn client_config(
         })
 }
 
-pub fn options(common_name: &str, host: &str, port: u16, tls: ClientConfig) -> MqttOptions {
+pub fn options(
+    common_name: &str,
+    host: &str,
+    port: u16,
+    transport: &BrokerTransport,
+    tls: ClientConfig,
+) -> MqttOptions {
+    // WEBSOCKET TRANSPORTS TAKE A URL AND IGNORE THE PORT ARGUMENT. rumqttc
+    // parses `broker_addr` itself for `Transport::Wss` and reads host and port
+    // out of it (`eventloop.rs`, `split_url`), so passing `host` here as well
+    // would connect somewhere else entirely, and passing the port twice is
+    // simply how the constructor is shaped. Its own example says as much.
+    let address = match transport {
+        BrokerTransport::Tls => host.to_string(),
+        BrokerTransport::WebSocket { path } => format!("wss://{host}:{port}{path}"),
+    };
+
     // The common name as the client id. It is unique per device by
     // construction, it is what the broker will call this connection anyway
     // (`peer_cert_as_username = cn`), and it gives correct take-over semantics:
     // a reconnecting device displaces its own stale session rather than living
     // beside it.
-    let mut options = MqttOptions::new(common_name, host, port);
+    let mut options = MqttOptions::new(common_name, address, port);
     options.set_keep_alive(KEEPALIVE);
 
     // A resumed session delivers pubacks for packet ids the new session never
@@ -171,10 +188,15 @@ pub fn options(common_name: &str, host: &str, port: u16, tls: ClientConfig) -> M
 
     // NO USERNAME AND NO PASSWORD. The listener has `enable_authn = false` and
     // `peer_cert_as_username = cn`, so anything sent here is overwritten by the
-    // certificate's common name before authorization ever sees it.
-    options.set_transport(Transport::tls_with_config(TlsConfiguration::Rustls(
-        Arc::new(tls),
-    )));
+    // certificate's common name before authorization ever sees it. That holds
+    // on both listeners: the WebSocket one reads the peer certificate from
+    // `cowboy_req:cert/1` into the same field the TCP one fills from the
+    // socket, and `emqx_channel:init/2` has no transport branch.
+    let rustls = TlsConfiguration::Rustls(Arc::new(tls));
+    options.set_transport(match transport {
+        BrokerTransport::Tls => Transport::tls_with_config(rustls),
+        BrokerTransport::WebSocket { .. } => Transport::wss_with_config(rustls),
+    });
     options
 }
 

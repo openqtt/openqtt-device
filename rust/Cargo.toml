@@ -19,7 +19,7 @@ tokio = { version = "1", features = ["rt", "macros", "time", "fs", "sync"] }
 # "expected struct CertificateDer, found struct CertificateDer" without saying
 # why. Both v4 and v5 of the SCADABLE gateway go through the re-export for this
 # reason. Check it with `cargo tree -i rustls`: there must be exactly one.
-rumqttc = { version = "0.25", default-features = false, features = ["use-rustls"] }
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls", "websocket"] }
 rustls-pemfile = "2"
 
 # The enrollment call, and the ONE place a public certificate authority is the

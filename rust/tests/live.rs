@@ -58,8 +58,15 @@
 //! no client certificate at all                 -> connection refused
 //!
 //! certificate handover, forced by shortening the renewal
-//!   -> four consecutive handovers, roughly 250ms each
+//!   -> five consecutive handovers, one connect each
 //!   -> ten messages delivered across them with no gap in the consumer
+//!
+//! the same device over a WEBSOCKET, OPENQTT_BROKER=wss://localhost:8084/mqtt,
+//! against a broker whose only external listener is wss
+//!   -> CONNACK 0, username still taken from the certificate CN
+//!   -> ingest/acme/production/pump-3/temperature 21.5
+//!   -> ws:default reported `running: false`, so the plaintext WebSocket
+//!      listener the schema materialises by default really is off
 //! ```
 //!
 //! The handover run needed two temporary changes that are NOT in the tree: the
