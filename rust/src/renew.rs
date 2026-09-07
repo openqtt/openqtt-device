@@ -70,25 +70,20 @@ pub(crate) fn jitter() -> f64 {
 /// A NEW KEYPAIR EVERY TIME, not a new certificate over the old key. It costs
 /// a few milliseconds on a P-256 curve and it means a key that leaked is worth
 /// at most seven days rather than the life of the device.
-pub(crate) async fn renew(
-    api: &enroll::Client,
-    store: &Store,
-    state: &State,
-) -> Result<(State, Duration)> {
+/// Ask for a certificate. DOES NOT WRITE IT DOWN, and the split is the point.
+///
+/// What comes back is already a credential: the api rotated the token when it
+/// answered, and the one it replaced survives exactly one more enrollment. So
+/// the caller must hold on to this until it is safely on disk, and must never
+/// respond to a failed write by asking again. Two enrollments that both fail to
+/// persist spend the grace window and lock the device out permanently.
+pub(crate) async fn fetch(api: &enroll::Client, state: &State) -> Result<(State, Duration)> {
     let identity = identity::generate(&state.common_name)?;
     let fresh = api
         .enroll(&state.common_name, &state.next_token, &identity.csr_pem)
         .await?;
+    report_clock(&fresh);
 
-    // FROM HERE THE RESPONSE IS A CREDENTIAL AND NOTHING MAY DISCARD IT.
-    //
-    // The api rotates the token on every success and the one it replaces
-    // survives exactly one more enrollment. So a 200 that this function throws
-    // away is a grace window spent for nothing, and two of them in a row lock
-    // the device out of the platform with no way back. Everything fallible now
-    // happens either BEFORE the request or AFTER the write: nothing in between.
-    // Checking the root used to sit here, which is exactly how a stale pin
-    // became permanent. It lives in `mqtt::client_config` instead.
     let next = State {
         common_name: fresh.common_name.clone(),
         certificate: fresh.certificate.clone(),
@@ -99,14 +94,6 @@ pub(crate) async fn renew(
         renew_after: fresh.renew_after,
         issued_at: fresh.server_time,
     };
-    // COMMITTED BEFORE ANYTHING IS TOLD ABOUT IT. The caller reads this file
-    // back to rebuild the connection, so signalling first hands it the
-    // certificate that was just replaced. The v4 gateway signalled first and a
-    // fleet presented the previous day's certificate until the broker started
-    // rejecting it.
-    store.save(&next)?;
-    report_clock(&fresh);
-
     let wait = next_wake(
         fresh.server_time,
         fresh.renew_after,
@@ -133,46 +120,77 @@ pub(crate) async fn task(
     mut wait: Duration,
     renewed: mpsc::Sender<()>,
 ) {
+    // A response that arrived but has not reached the disk yet. IT IS NEVER
+    // THROWN AWAY AND NEVER RE-REQUESTED. Asking again after a failed write
+    // would spend the one grace enrollment this device holds in reserve, and
+    // doing that twice ends its life on the platform. So a write that fails is
+    // retried as a WRITE, with the same response, for as long as it takes.
+    let mut unsaved: Option<(State, Duration)> = None;
+
     loop {
         tracing::debug!(seconds = wait.as_secs(), "next certificate renewal");
         tokio::time::sleep(wait).await;
 
         let mut attempt = 0u32;
         loop {
-            match renew(&api, &store, &state).await {
-                Ok((fresh, next)) => {
-                    tracing::info!(
-                        not_after = %fresh.not_after,
-                        "certificate renewed"
-                    );
-                    state = fresh;
-                    wait = next;
-                    // The device has gone away. Nothing left to hand over to.
-                    if renewed.send(()).await.is_err() {
-                        return;
+            let held = match unsaved.take() {
+                Some(held) => held,
+                None => match fetch(&api, &state).await {
+                    Ok(got) => got,
+                    Err(error) => {
+                        pause(&error, attempt, "certificate renewal failed").await;
+                        attempt = attempt.saturating_add(1);
+                        continue;
                     }
-                    break;
-                }
-                Err(error) => {
-                    let pace = error.retry();
-                    let pause = enroll::backoff(attempt, pace);
-                    // A 403 and a flat network both reach here, so the log has
-                    // to carry which one it was and how long the wait will be.
-                    // At the slow pace those waits are hours, and a line that
-                    // did not say so would read as a hung device.
-                    tracing::warn!(
-                        %error,
-                        ?pace,
-                        seconds = pause.as_secs(),
-                        attempt,
-                        "certificate renewal failed, will try again"
-                    );
-                    attempt = attempt.saturating_add(1);
-                    tokio::time::sleep(pause).await;
-                }
+                },
+            };
+
+            // COMMITTED BEFORE ANYTHING IS TOLD ABOUT IT. The supervisor reads
+            // this file back to rebuild the connection, so signalling first
+            // hands it the certificate that was just replaced. The v4 gateway
+            // signalled first and a fleet presented the previous day's
+            // certificate until the broker started rejecting it.
+            if let Err(error) = store.save(&held.0) {
+                tracing::error!(
+                    %error,
+                    "a certificate was issued but could not be written down; \
+                     keeping it in memory and retrying the write rather than \
+                     asking for another one"
+                );
+                unsaved = Some(held);
+                pause(&error, attempt, "writing the renewed certificate failed").await;
+                attempt = attempt.saturating_add(1);
+                continue;
             }
+
+            tracing::info!(not_after = %held.0.not_after, "certificate renewed");
+            state = held.0;
+            wait = held.1;
+            // The device has gone away. Nothing left to hand over to.
+            if renewed.send(()).await.is_err() {
+                return;
+            }
+            break;
         }
     }
+}
+
+/// Wait out a failure at the pace the failure deserves.
+///
+/// A 403 and a flat network both arrive here, so the line has to say which it
+/// was and how long the wait is. At the slow pace those waits are hours, and a
+/// log that did not say so would read as a hung device.
+async fn pause(error: &crate::Error, attempt: u32, doing: &str) {
+    let pace = error.retry();
+    let waiting = enroll::backoff(attempt, pace);
+    tracing::warn!(
+        %error,
+        ?pace,
+        seconds = waiting.as_secs(),
+        attempt,
+        "{doing}, will try again"
+    );
+    tokio::time::sleep(waiting).await;
 }
 
 fn report_clock(fresh: &Enrolled) {

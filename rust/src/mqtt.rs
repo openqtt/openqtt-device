@@ -9,8 +9,8 @@ use rumqttc::tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
 };
 use rumqttc::tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use rumqttc::{Event, EventLoop, MqttOptions, Outgoing, Packet, TlsConfiguration, Transport};
-use tokio::sync::oneshot;
+use rumqttc::{Event, EventLoop, MqttOptions, Outgoing, Packet, QoS, TlsConfiguration, Transport};
+use tokio::sync::{oneshot, Notify};
 
 use crate::error::{Error, Result};
 
@@ -21,20 +21,24 @@ use crate::error::{Error, Result};
 /// is the broker.
 pub const MAX_PACKET: usize = 1024 * 1024;
 
-/// What the broker prepends. Counted here because the packet the LISTENER
-/// measures is the mounted one, not the one this device wrote.
-const MOUNT_PREFIX: &str = "ingest/";
+/// MQTT stores a topic's length in two bytes, so this is the protocol's own
+/// ceiling and not a policy of ours.
+const MAX_TOPIC_BYTES: usize = u16::MAX as usize;
 
-/// How large the PUBLISH will be by the time the broker measures it.
+/// How large the PUBLISH this device sends will actually be.
 ///
-/// Three things the payload length on its own leaves out: the two bytes of
-/// topic length and two of packet identifier in the variable header, the one to
-/// four bytes of the fixed header, and the mountpoint, which makes the topic
-/// the broker sees longer than the one that was passed in.
-pub fn packet_size(topic: &str, common_name: usize, payload: usize) -> usize {
-    let mounted = MOUNT_PREFIX.len() + common_name + 1 + topic.len();
-    // 2 for the topic length, 2 for the packet identifier at QoS 1 and 2.
-    let remaining = 2 + mounted + 2 + payload;
+/// THE PACKET THIS MEASURES IS THE ONE ON THE WIRE, which is the one the
+/// broker's `max_packet_size` is applied to: the frame is parsed, and only
+/// afterwards does the mountpoint get prepended. Counting the mountpoint here,
+/// as this briefly did, refuses messages the broker would have accepted.
+///
+/// What the payload length alone leaves out is the two bytes of topic length,
+/// the packet identifier when there is one, and the one to four bytes of the
+/// fixed header.
+pub fn packet_size(topic: &str, payload: usize, qos: QoS) -> usize {
+    // The packet identifier exists only above QoS 0.
+    let identifier = if matches!(qos, QoS::AtMostOnce) { 0 } else { 2 };
+    let remaining = 2 + topic.len() + identifier + payload;
     1 + remaining_length_bytes(remaining) + remaining
 }
 
@@ -212,6 +216,17 @@ pub fn check_topic(topic: &str) -> Result<()> {
             "A topic cannot contain a null byte.".to_string(),
         ));
     }
+    // The mounted topic is what has to fit, and the broker builds it by
+    // prepending `ingest/<common name>/`. Refusing at the protocol ceiling
+    // rather than a byte under it, because the exact prefix is not known here
+    // and a message this size is a bug in the caller either way.
+    if topic.len() > MAX_TOPIC_BYTES {
+        return Err(Error::Topic(format!(
+            "the topic is {} bytes. MQTT stores a topic's length in two bytes, \
+             so {MAX_TOPIC_BYTES} is the most that can be expressed.",
+            topic.len()
+        )));
+    }
     // `max_topic_levels` is 128 on the listener, and the mountpoint spends
     // FOUR of them before this topic starts: `ingest` plus the three the common
     // name is made of, `<organization>/<namespace>/<device>`.
@@ -240,14 +255,16 @@ pub fn check_topic(topic: &str) -> Result<()> {
 /// the flag every device logs a connection error at WARN once a day, for the
 /// most routine thing it does, and a log that cries wolf daily is one nobody
 /// reads on the day it matters.
-/// `flushed` fires when this loop has actually put a DISCONNECT on the wire.
-/// That is the signal a handover waits on, and it is a real one rather than a
-/// guess at how long writing takes: rumqttc drains its request queue in order,
-/// so the DISCONNECT leaving means everything queued before it left too.
+/// `flushed` is notified when this loop has actually put a DISCONNECT on the
+/// wire. That is a real signal rather than a guess at how long writing takes:
+/// rumqttc drains its request queue in order, so the DISCONNECT leaving means
+/// everything queued before it left too. A `Notify` and not a channel because
+/// two different callers wait on it, a handover and a shutdown, and each
+/// connection is only ever asked to disconnect once.
 pub async fn pump(
     mut eventloop: EventLoop,
     mut ready: Option<oneshot::Sender<()>>,
-    mut flushed: Option<oneshot::Sender<()>>,
+    flushed: Arc<Notify>,
     retiring: Arc<AtomicBool>,
 ) {
     loop {
@@ -260,14 +277,20 @@ pub async fn pump(
             }
             Ok(Event::Outgoing(Outgoing::Disconnect)) => {
                 tracing::debug!("disconnect sent; everything queued before it has gone out");
-                if let Some(sender) = flushed.take() {
-                    let _ = sender.send(());
-                }
+                flushed.notify_waiters();
             }
             Ok(_) => {}
+            // A RETIRED CONNECTION DOES NOT COME BACK. Returning rather than
+            // retrying is the whole point: rumqttc reconnects for as long as
+            // something keeps polling, and both connections carry the same
+            // client id, so a retired loop that reconnected would take the
+            // session back off its own replacement. Measured against the real
+            // broker, that produced about a second of the two of them trading
+            // it on every renewal. Its remaining job was to flush the
+            // DISCONNECT, and by the time an error arrives that is done.
             Err(error) if retiring.load(Ordering::Relaxed) => {
                 tracing::debug!(%error, "the replaced connection closed, as asked");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                return;
             }
             Err(error) => {
                 // A certificate problem reads as a plain connection error here
@@ -275,6 +298,14 @@ pub async fn pump(
                 // names the likely cause without pretending to know.
                 tracing::warn!(%error, "broker connection error, retrying");
                 tokio::time::sleep(Duration::from_millis(500)).await;
+                // Checked again on the way out of the backoff. A handover can
+                // retire this loop while it is sleeping, and without this it
+                // would reconnect once more before noticing, taking the session
+                // back off the connection that just replaced it.
+                if retiring.load(Ordering::Relaxed) {
+                    tracing::debug!("retired while backing off; not reconnecting");
+                    return;
+                }
             }
         }
     }

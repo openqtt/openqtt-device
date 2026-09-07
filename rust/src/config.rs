@@ -130,7 +130,17 @@ fn clean_api(raw: &str) -> Result<String> {
 /// Whether an authority names this machine. Handles `host`, `host:port` and
 /// `[::1]:port`, and stops at the first `/` so a path cannot smuggle a name in.
 fn is_loopback(authority: &str) -> bool {
-    let authority = authority.split('/').next().unwrap_or_default();
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    // USERINFO IS THE TRAP AND IT IS NOT THEORETICAL. In
+    // `http://127.0.0.1:80@example.com` the host is example.com; everything
+    // before the `@` is a username and password. A check that scans for the
+    // first thing shaped like an address finds the loopback in the userinfo and
+    // waves the whole URL through, and the device then posts its rotating token
+    // in clear to somebody else's server. Nothing legitimate here has userinfo,
+    // so the presence of an `@` is enough to refuse.
+    if authority.contains('@') {
+        return false;
+    }
     let host = match authority.strip_prefix('[') {
         Some(rest) => rest.split(']').next().unwrap_or_default(),
         None => authority
@@ -275,6 +285,11 @@ mod tests {
             "http://127.0.0.1.example.com",
             "http://example.com/localhost",
             "http://example.com/127.0.0.1",
+            // Userinfo: the host here is example.com, not the loopback that
+            // appears first.
+            "http://127.0.0.1:80@example.com",
+            "http://localhost@example.com",
+            "http://user:pass@127.0.0.1.example.com",
         ] {
             assert!(clean_api(refused).is_err(), "{refused}");
         }

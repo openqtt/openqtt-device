@@ -134,6 +134,15 @@ passed. It renews rather than believe itself. Without that check a device
 booting at the epoch reads a far-future expiry, calls a long-dead certificate
 healthy, and repeats the same failed handshake on every restart forever.
 
+**What that still does not fix, stated plainly.** A device whose clock is wrong
+by more than the enrollment endpoint's certificate lifetime cannot enrol either,
+because the HTTPS handshake to `api.openqtt.com` validates dates against the
+same broken clock. The device will keep trying and its log will say why, but it
+cannot recover on its own: something has to give it the time first, whether NTP,
+a GPS fix, an RTC with a working battery, or a hand-set date. This crate cannot
+bootstrap trusted time out of nothing, and pretending otherwise would be worse
+than saying so.
+
 **Renewals are spread.** The api's rate limiter counts the address it sees,
 which is the ingress and not the device, so a whole fleet shares one bucket of
 60 requests a minute. Devices installed on the same day would otherwise come

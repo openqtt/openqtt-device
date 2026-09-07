@@ -65,7 +65,7 @@ use chrono::{TimeDelta, Utc};
 use rumqttc::tokio_rustls::rustls::pki_types::CertificateDer;
 use rumqttc::{AsyncClient, QoS};
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 pub use crate::config::Config;
@@ -87,7 +87,12 @@ const REQUEST_QUEUE: usize = 256;
 
 /// How long the outgoing connection is left polling after it is told to
 /// disconnect, so the packet reaches the wire before the task is stopped.
-const DISCONNECT_GRACE: Duration = Duration::from_millis(200);
+const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
+
+/// How many times a first enrollment retries writing its identity down before
+/// giving up. Small, because somebody is watching a first run and a device that
+/// cannot write to its own disk is not going to start working.
+const SAVE_ATTEMPTS: u32 = 5;
 
 /// The pinned root, and where it came from, so a mismatch can name the file.
 #[derive(Clone)]
@@ -113,6 +118,10 @@ pub struct Device {
     /// had already captured a client.
     client: Arc<ArcSwap<AsyncClient>>,
     common_name: String,
+    /// Notified when a connection has put its DISCONNECT on the wire. Shared
+    /// with every polling task, so `shutdown` waits on the same signal a
+    /// handover does instead of sleeping and hoping.
+    flushed: Arc<Notify>,
     /// Aborted on drop. The supervisor owns the polling task, so aborting the
     /// supervisor drops that too.
     _tasks: Vec<Abort>,
@@ -147,7 +156,8 @@ impl Device {
 
         let (client, eventloop) = build_client(&current, &pin, &config)?;
         let (ready, connected) = oneshot::channel();
-        let pump = Connection::spawn(eventloop, ready);
+        let flushed = Arc::new(Notify::new());
+        let pump = Connection::spawn(eventloop, ready, Arc::clone(&flushed));
 
         let common_name = current.common_name.clone();
         let cell = Arc::new(ArcSwap::from_pointee(client));
@@ -196,6 +206,7 @@ impl Device {
         Ok(Device {
             client: cell,
             common_name,
+            flushed,
             _tasks: vec![renewing, supervising],
         })
     }
@@ -230,7 +241,7 @@ impl Device {
         // the client refuse it later, which is the wrong place to find out.
         // The topic the BROKER sees is longer still: the mountpoint prepends
         // `ingest/<common name>/` before it is measured against the listener.
-        let packet = mqtt::packet_size(topic, self.common_name.len(), payload.len());
+        let packet = mqtt::packet_size(topic, payload.len(), qos);
         if packet > mqtt::MAX_PACKET {
             return Err(Error::Topic(format!(
                 "this message is {packet} bytes once the topic and the header are \
@@ -253,10 +264,24 @@ impl Device {
     /// A clean DISCONNECT suppresses the last will, which is what tells the
     /// platform this was a planned stop and not a machine that fell over.
     pub async fn shutdown(self) {
+        // Registered before the disconnect is asked for, or a fast connection
+        // notifies before anything is listening. Waiting for the signal rather
+        // than sleeping is what stops a publish that was still queued from
+        // being aborted along with the task at the end of this function.
+        let flushed = self.flushed.notified();
+        tokio::pin!(flushed);
+        flushed.as_mut().enable();
+
         let _ = self.client.load().disconnect().await;
-        // Let the polling task put the packet on the wire before the tasks are
-        // aborted by the drop at the end of this function.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        if tokio::time::timeout(DISCONNECT_GRACE, flushed)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                seconds = DISCONNECT_GRACE.as_secs(),
+                "shutting down without confirmation that queued messages were sent"
+            );
+        }
     }
 }
 
@@ -289,22 +314,25 @@ impl Drop for Abort {
 struct Connection {
     task: JoinHandle<()>,
     retiring: Arc<AtomicBool>,
-    flushed: Option<oneshot::Receiver<()>>,
+    flushed: Arc<Notify>,
 }
 
 impl Connection {
-    fn spawn(eventloop: rumqttc::EventLoop, ready: oneshot::Sender<()>) -> Connection {
+    fn spawn(
+        eventloop: rumqttc::EventLoop,
+        ready: oneshot::Sender<()>,
+        flushed: Arc<Notify>,
+    ) -> Connection {
         let retiring = Arc::new(AtomicBool::new(false));
-        let (sent, flushed) = oneshot::channel();
         Connection {
             task: tokio::spawn(mqtt::pump(
                 eventloop,
                 Some(ready),
-                Some(sent),
+                Arc::clone(&flushed),
                 Arc::clone(&retiring),
             )),
             retiring,
-            flushed: Some(flushed),
+            flushed,
         }
     }
 
@@ -322,28 +350,39 @@ impl Connection {
     /// request queue in order, so seeing the DISCONNECT leave means everything
     /// queued ahead of it left too.
     ///
-    /// What it still does not promise is delivery. A QoS 1 publish waiting on
-    /// its PUBACK when the handover starts is lost, because `clean_session` is
-    /// true and the replacement client shares no packet-id state with this one.
-    /// Closing that would mean a persistent session, which brings back the
+    /// WHAT IT DOES NOT PROMISE IS DELIVERY, and the reason is worth writing
+    /// down because it is a trade and not an oversight. Both connections carry
+    /// the same client id, so the broker takes this one over the moment the
+    /// replacement is accepted, and after that there is nothing to flush to: a
+    /// publish still queued at that instant is lost. Flushing FIRST and
+    /// connecting the replacement afterwards would save it, at the price of
+    /// tearing down a working connection before knowing the new certificate is
+    /// accepted. Losing at most an in-flight message once a day is the smaller
+    /// harm than going dark until the next renewal, so this is the order.
+    ///
+    /// QoS 1 does not rescue it either: `clean_session` is true and the
+    /// replacement shares no packet-id state, and changing that brings back the
     /// unsolicited-puback reconnect loop `mqtt::options` exists to avoid.
-    async fn drain(&mut self, budget: Duration) {
-        let Some(flushed) = self.flushed.take() else {
-            return;
-        };
+    async fn drain(&self, client: &AsyncClient, budget: Duration) {
+        // Registered BEFORE the disconnect is asked for. A notification with no
+        // waiter is dropped on the floor, so building the future afterwards is
+        // a race that loses exactly when the connection is fastest.
+        let flushed = self.flushed.notified();
+        tokio::pin!(flushed);
+        flushed.as_mut().enable();
+
+        let _ = client.disconnect().await;
         if tokio::time::timeout(budget, flushed).await.is_err() {
-            tracing::warn!(
+            // Expected during a handover and not worth a warning: both
+            // connections carry the same client id, so accepting the
+            // replacement is what closed this one, and a connection the broker
+            // has already taken over has nothing left to flush to. It is a
+            // warning on shutdown, where there is no such excuse.
+            tracing::debug!(
                 seconds = budget.as_secs(),
-                "the outgoing connection did not report its disconnect in time; \
-                 anything still queued on it is being dropped"
+                "no disconnect was reported; the connection was most likely already closed"
             );
         }
-    }
-
-    /// Stop the task now. Idempotent, and `Drop` does the same, so calling it
-    /// early is only ever a matter of timing.
-    fn stop(&self) {
-        self.task.abort();
     }
 }
 
@@ -413,16 +452,24 @@ async fn establish(
         }
         // Spent, or held by a device whose clock cannot be trusted to say. The
         // token is what proves this device, and the token does not expire.
+        //
+        // RENEWED BY THE BACKGROUND TASK RATHER THAN HERE, with a wait of zero.
+        // Doing it inline made exactly one unpaced request whose failure
+        // returned from `with_config` before the renewal task existed: a device
+        // refused by the platform then had no backoff at all, and a service
+        // manager restarting it hammered a rate-limit bucket the whole fleet
+        // shares. The task has the pacing and the retry-the-write rule, so the
+        // spent certificate goes to it and the connection simply fails until it
+        // lands.
         Some(held) => {
             tracing::info!(
                 common_name = %held.common_name,
                 not_after = %held.not_after,
-                "the stored certificate cannot be relied on; enrolling before connecting"
+                "the stored certificate cannot be relied on; renewing at once"
             );
-            let (current, wait) = renew::renew(api, store, &held).await?;
             Ok(Established {
-                current,
-                wait,
+                current: held,
+                wait: Duration::ZERO,
                 first: false,
             })
         }
@@ -441,6 +488,14 @@ async fn establish(
 /// device that booted thinking it was 1970 would see a far-future `not_after`,
 /// declare a long-expired certificate healthy, fail the handshake with
 /// something unhelpful, and do it again on every restart forever.
+///
+/// WHAT THIS CANNOT DO IS BOOTSTRAP THE TIME. A clock wrong by more than the
+/// enrollment endpoint's own certificate lifetime fails the HTTPS handshake to
+/// the api as well, so the device cannot fetch a `server_time` to correct
+/// itself with. It will keep trying, and the warning above says what is wrong,
+/// but something outside this crate has to supply the time: NTP, a GPS fix, an
+/// RTC with a live battery, or a person. Detecting the condition and recovering
+/// from it are different problems, and only the first is solved here.
 fn usable(held: &state::State) -> bool {
     let now = Utc::now();
     if now < held.issued_at {
@@ -512,7 +567,26 @@ async fn first_enrollment(
         renew_after: fresh.renew_after,
         issued_at: fresh.server_time,
     };
-    store.save(&held)?;
+    // RETRY THE WRITE, NEVER THE REQUEST. The token has already rotated on the
+    // api's side, so asking again would spend the grace enrollment. If it still
+    // will not write after this, the error is returned and the token is lost
+    // with it: there is nothing better available on a first run, and a device
+    // whose disk is unwritable has a larger problem than enrollment.
+    let mut attempt = 0u32;
+    while let Err(error) = store.save(&held) {
+        if attempt >= SAVE_ATTEMPTS {
+            tracing::error!(
+                %error,
+                "a certificate was issued and could not be written down. The \
+                 enrollment token is spent; this device needs a new one."
+            );
+            return Err(error);
+        }
+        let waiting = enroll::backoff(attempt, error.retry());
+        tracing::warn!(%error, seconds = waiting.as_secs(), "could not write the new identity down");
+        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(waiting).await;
+    }
     tracing::info!(common_name = %held.common_name, "enrolled");
 
     let wait = renew::next_wake(
@@ -559,45 +633,47 @@ async fn supervise(
             }
         };
 
-        // SWAPPED BEFORE THE NEW LOOP IS RUNNING, on purpose. A publish in
-        // this window resolves through the cell, lands in the new client's
-        // queue, and goes out as soon as the loop starts. Swapping afterwards
-        // would send it through a connection that is about to be torn down.
-        // Tell the outgoing loop first, so the close it is about to see reads
-        // as the handover it is rather than as a fault.
-        polling.retire();
-        let previous = cell.swap(Arc::new(client));
-        let _ = previous.disconnect().await;
-        // The old loop is still polling, which is what puts the DISCONNECT on
-        // the wire. A clean DISCONNECT suppresses the last will, so the
-        // platform sees a planned handover rather than a machine falling over.
-        // Waiting for the loop to SAY it went out, rather than sleeping a
-        // guessed interval, is what stops a queued publish being dropped with
-        // the task. See `Connection::drain`.
-        polling.drain(DISCONNECT_GRACE).await;
-
-        // AND NOW STOP IT, BEFORE THE REPLACEMENT STARTS. rumqttc reconnects
-        // on its own as long as something keeps polling, and this loop still
-        // holds the certificate that was just replaced. Two connections under
-        // one client id means the broker takes one of them over, and which one
-        // survives is a race nobody should have to think about.
-        polling.stop();
-
+        // THE REPLACEMENT HAS TO PROVE ITSELF BEFORE THE WORKING ONE IS GIVEN
+        // UP. The old order disconnected and aborted the live connection first
+        // and only then started the new one, so a certificate the broker
+        // refused took the device dark immediately, even though the one it was
+        // already using had days left.
+        //
+        // Both connections use the same client id, so the broker takes the
+        // older one over the moment this one is accepted. That is survivable
+        // and brief; going dark on a certificate the broker will not accept is
+        // neither.
         let (ready, connected) = oneshot::channel();
-        polling = Connection::spawn(eventloop, ready);
+        let replacement = Connection::spawn(eventloop, ready, Arc::clone(&polling.flushed));
+
         if tokio::time::timeout(HANDOFF_TIMEOUT, connected)
             .await
             .is_err()
         {
-            // Not an error. rumqttc keeps retrying inside the task that was
-            // just spawned, so the connection comes back on its own.
-            tracing::warn!(
+            tracing::error!(
                 seconds = HANDOFF_TIMEOUT.as_secs(),
-                "the renewed connection has not been acknowledged yet; leaving it to retry"
+                "the renewed certificate was not accepted by the broker; keeping \
+                 the connection that works and trying again at the next renewal"
             );
-        } else {
-            tracing::info!("broker connection now using the renewed certificate");
+            // The old connection was never retired, so it is untouched and
+            // reconnects on its own if the broker took its session over.
+            drop(replacement);
+            continue;
         }
+
+        // Accepted. RETIRE THE OLD ONE NOW AND NOT A MOMENT EARLIER. The broker
+        // has just taken its session over, because both carry the same client
+        // id, and a loop still allowed to reconnect would take it straight
+        // back. Retiring is what stops it: a retired loop flushes and exits.
+        // Measured against the real broker, retiring only after the replacement
+        // is proven turned about a second of the two of them trading the
+        // session into a clean swap.
+        polling.retire();
+        let previous = cell.swap(Arc::new(client));
+        // Now let it say goodbye and flush whatever it still had queued.
+        polling.drain(&previous, DISCONNECT_GRACE).await;
+        polling = replacement;
+        tracing::info!("broker connection now using the renewed certificate");
     }
     // The channel closed. `renew::task` never returns for any other reason, so
     // this means the `Device` itself is gone: take the connection down with it

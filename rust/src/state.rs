@@ -94,7 +94,7 @@ impl Store {
     /// top, then fsync the directory so the rename itself survives a power cut.
     /// A reader either sees the whole previous generation or the whole new one.
     pub fn save(&self, state: &State) -> Result<()> {
-        let directory = self.path.parent().unwrap_or(Path::new("."));
+        let directory = directory_of(&self.path);
         ensure_directory(directory)?;
 
         let temporary = self.path.with_extension("json.new");
@@ -126,6 +126,19 @@ impl Store {
         let handle = fs::File::open(directory).map_err(|error| io(directory, error))?;
         handle.sync_all().map_err(|error| io(directory, error))?;
         Ok(())
+    }
+}
+
+/// The directory a state file lives in.
+///
+/// `Path::new("state.json").parent()` is `Some("")` rather than `None`, and an
+/// empty path is not the current directory to anything that tries to open it.
+/// Left unnormalised, a bare relative state path failed every save, which for a
+/// device means losing the token it had just been handed.
+fn directory_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
     }
 }
 
@@ -201,6 +214,32 @@ mod tests {
             renew_after: Utc::now() + chrono::TimeDelta::days(1),
             issued_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn a_bare_relative_path_lives_in_the_current_directory() {
+        // Not `""`, which is what `parent()` actually returns here and what
+        // nothing can open.
+        assert_eq!(directory_of(Path::new("state.json")), Path::new("."));
+        assert_eq!(
+            directory_of(Path::new("openqtt/state.json")),
+            Path::new("openqtt")
+        );
+        assert_eq!(
+            directory_of(Path::new("/etc/openqtt/state.json")),
+            Path::new("/etc/openqtt")
+        );
+    }
+
+    #[test]
+    fn a_relative_state_file_round_trips() {
+        let home = tempfile::tempdir().unwrap();
+        // Relative to a directory that exists, without touching the process
+        // working directory: `set_current_dir` is global and these run in
+        // parallel.
+        let store = Store::new(home.path().join("state.json"));
+        store.save(&sample("oqe_first")).unwrap();
+        assert_eq!(store.load().unwrap().unwrap().next_token, "oqe_first");
     }
 
     #[test]

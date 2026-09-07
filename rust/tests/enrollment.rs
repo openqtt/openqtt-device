@@ -79,6 +79,26 @@ impl Respond for Enrollment {
     }
 }
 
+/// Wait for the state file to say what it is expected to say.
+///
+/// The renewal is a BACKGROUND task now, so a test that reads the file the
+/// instant `with_config` returns is racing it. Polling for the answer with a
+/// deadline is the difference between a test and a flake.
+async fn eventually(state: &std::path::Path, token: &str) {
+    for _ in 0..100 {
+        if let Ok(raw) = std::fs::read_to_string(state) {
+            if let Ok(held) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if held["next_token"] == token {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let raw = std::fs::read_to_string(state).unwrap_or_default();
+    panic!("the state file never reached {token}. It holds: {raw}");
+}
+
 struct Fixture {
     _home: tempfile::TempDir,
     _server: MockServer,
@@ -245,13 +265,9 @@ async fn a_clock_behind_its_own_certificate_renews_instead_of_trusting_it() {
     held["issued_at"] = serde_json::json!("2099-01-01T00:00:00Z");
     std::fs::write(&state, serde_json::to_string_pretty(&held).unwrap()).unwrap();
 
-    let _ = Device::with_config(fixture.config).await;
-    let after: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
-    assert_eq!(
-        after["next_token"], "oqe_2",
-        "it should have gone back to the api rather than trusted its own clock"
-    );
+    // Kept alive: dropping the device stops the renewal task it owns.
+    let _device = Device::with_config(fixture.config).await;
+    eventually(&state, "oqe_2").await;
 }
 
 #[tokio::test]

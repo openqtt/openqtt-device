@@ -35,9 +35,10 @@ pub const FAST_CAP: Duration = Duration::from_secs(15 * 60);
 /// averages one attempt per half-cap, so at 15 minutes a dead device costs 8
 /// requests an hour and about 450 of them consume the whole bucket, which is a
 /// handful of decommissioned machines stopping every healthy device from
-/// renewing. At 6 hours it is 4 a day, and it takes something on the order of
-/// ten thousand before the arithmetic matters. A device re-enabled in the
-/// console still recovers on its own, which is the property being protected.
+/// renewing. At 6 hours the mean wait is 3, so it is 8 a day, and it takes
+/// something on the order of ten thousand devices before the arithmetic
+/// matters. A device re-enabled in the console still recovers on its own, which
+/// is the property being protected.
 pub const SLOW_CAP: Duration = Duration::from_secs(6 * 60 * 60);
 
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -75,6 +76,13 @@ pub struct Client {
 impl Client {
     pub fn new(url: impl Into<String>) -> Result<Self> {
         let http = reqwest::Client::builder()
+            // NO REDIRECTS. reqwest follows up to ten by default, and a 307 or
+            // 308 replays the POST body, so an https endpoint that answered
+            // with a redirect to http would put the enrollment token on the
+            // wire in clear after `config::clean_api` had already refused
+            // exactly that. Enrollment is one POST to one known URL; there is
+            // nothing here a redirect could legitimately mean.
+            .redirect(reqwest::redirect::Policy::none())
             .use_preconfigured_tls(public_roots())
             .timeout(Duration::from_secs(30))
             .user_agent(concat!("openqtt-device/", env!("CARGO_PKG_VERSION")))
