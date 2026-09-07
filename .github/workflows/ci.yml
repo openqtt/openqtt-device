@@ -1,0 +1,65 @@
+# The gate. Ordered fail-fast: the cheapest checks that catch the most run first.
+#
+# `--locked` on every cargo invocation, because Cargo.lock is committed here on
+# purpose. This is firmware-shaped software and the bytes that were tested are
+# the bytes that go on a device, so a dependency resolving differently in CI
+# than on disk is a failure and not a convenience.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The example is the README. A snippet that does not compile is worse
+      # than no snippet, so it is built rather than trusted.
+      - name: Examples build
+        run: cargo build --locked --examples
+
+      - name: Tests
+        run: cargo test --locked
+
+  # The house-wide copy rule, gated rather than remembered.
+  copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: No em dashes in prose
+        run: |
+          if grep -rn $'—' --include="*.md" .; then
+            echo "Em dashes are not used in SCADABLE copy."
+            exit 1
+          fi

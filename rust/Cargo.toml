@@ -1,0 +1,64 @@
+[package]
+name = "openqtt-device"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Enrol a device with OpenQTT, keep its certificate fresh, and publish over mTLS MQTT."
+license = "Apache-2.0"
+repository = "https://github.com/openqtt/openqtt-device"
+readme = "../README.md"
+keywords = ["mqtt", "iot", "mtls", "x509", "openqtt"]
+categories = ["embedded", "network-programming"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "fs", "sync"] }
+
+# ONE rustls, and it is reached through `rumqttc::tokio_rustls::rustls` rather
+# than named here. A direct `rustls` dependency that resolves to a different
+# version gives two incompatible `CertificateDer` types, and the compiler says
+# "expected struct CertificateDer, found struct CertificateDer" without saying
+# why. Both v4 and v5 of the SCADABLE gateway go through the re-export for this
+# reason. Check it with `cargo tree -i rustls`: there must be exactly one.
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls"] }
+rustls-pemfile = "2"
+
+# The enrollment call, and the ONE place a public certificate authority is the
+# right answer: api.openqtt.com is behind Cloudflare and publicly signed. The
+# broker is not, and `src/mqtt.rs` trusts a single pinned root instead.
+#
+# `rustls-no-provider` rather than `rustls`, because reqwest's own `rustls`
+# feature verifies with `rustls-platform-verifier`, which on Linux reads the
+# host trust store and fails on an image that ships none. Minimal Alpine and
+# Yocto images routinely ship none. We hand reqwest a config built from the
+# bundled Mozilla roots instead, so the enrollment call does not depend on
+# anything being installed next to the binary.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+webpki-roots = "1"
+
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+# The live MQTT client behind a lock-free cell. See `src/renew.rs`: without
+# this the crate cannot pick up a renewed certificate without a restart.
+arc-swap = "1"
+rand = "0.9"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+wiremock = "0.6"
+tempfile = "3"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs", "x509-parser"] }  # x509-parser: the test mock signs the device's real CSR
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Only applies when this package is the root, which means the example and
+# anything built out of this repository. A device image is the target: small
+# and stripped beats fast to build.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
