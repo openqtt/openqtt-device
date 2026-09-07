@@ -37,6 +37,37 @@
 //! ```sh
 //! mosquitto_sub -h <broker> -p 1883 -t 'ingest/acme/production/pump-3/#' -v
 //! ```
+//!
+//! # What was measured
+//!
+//! 2026-09-07, against `ghcr.io/openqtt/openqtt@sha256:aaea53c9`, the digest
+//! `stacks/prod/70-broker/main.tf` pins, with the production `acl.conf`, a
+//! throwaway CA and a stub that issues the same leaf profile as
+//! `services/pki.py`.
+//!
+//! ```text
+//! enrol, connect, publish `temperature`
+//!   -> CONNACK 0, username taken from the certificate CN
+//!   -> an internal consumer on 1883, as svc.ingest, received
+//!      ingest/acme/production/pump-3/temperature 21.5
+//!   -> state.json 0600 in a 0700 directory, holding a rotated token
+//!      rather than the bootstrap one
+//!
+//! the same device subscribes to `temperature`  -> denied
+//! the same device subscribes to `#`            -> denied
+//! no client certificate at all                 -> connection refused
+//!
+//! certificate handover, forced by shortening the renewal
+//!   -> four consecutive handovers, roughly 250ms each
+//!   -> ten messages delivered across them with no gap in the consumer
+//! ```
+//!
+//! The handover run needed two temporary changes that are NOT in the tree: the
+//! stub issued three-hour certificates due for renewal after four seconds, and
+//! `renew::SPREAD` was set to zero. Both exist because the spread is a quarter
+//! of the window by design, so a real handover is up to 45 minutes late on
+//! purpose and cannot be waited for. If you reproduce it, change those two and
+//! change them back.
 
 use openqtt_device::{Config, Device};
 
