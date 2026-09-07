@@ -56,6 +56,7 @@ mod renew;
 mod state;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -112,8 +113,8 @@ pub struct Device {
     /// had already captured a client.
     client: Arc<ArcSwap<AsyncClient>>,
     common_name: String,
-    /// Aborted on drop, in order. The supervisor owns the polling task, so
-    /// aborting the supervisor drops its guard and stops that too.
+    /// Aborted on drop. The supervisor owns the polling task, so aborting the
+    /// supervisor drops that too.
     _tasks: Vec<Abort>,
 }
 
@@ -137,7 +138,7 @@ impl Device {
 
         let (client, eventloop) = build_client(&current, &pin, &config)?;
         let (ready, connected) = oneshot::channel();
-        let pump = Abort(tokio::spawn(mqtt::pump(eventloop, Some(ready))));
+        let pump = Connection::spawn(eventloop, ready);
         let acknowledged = tokio::time::timeout(config.connect_timeout, connected).await;
         if acknowledged.is_err() || acknowledged.is_ok_and(|inner| inner.is_err()) {
             return Err(Error::Timeout {
@@ -238,21 +239,50 @@ impl std::fmt::Debug for Device {
     }
 }
 
-/// Aborts the task it holds when it goes out of scope, including when the task
-/// holding IT is aborted.
+/// Aborts the task it holds when it goes out of scope, INCLUDING when the task
+/// holding it is itself aborted. That is what stops the polling loop when the
+/// `Device` is dropped: the supervisor owns the connection, and dropping the
+/// supervisor's future drops what its stack was holding.
 struct Abort(JoinHandle<()>);
-
-impl Abort {
-    /// Stop the task now, keeping the handle. Idempotent, and `Drop` does the
-    /// same thing, so calling it early is only ever a matter of timing.
-    fn stop(&self) {
-        self.0.abort();
-    }
-}
 
 impl Drop for Abort {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// One polling task, and the switch that tells it it is on its way out.
+struct Connection {
+    task: JoinHandle<()>,
+    retiring: Arc<AtomicBool>,
+}
+
+impl Connection {
+    fn spawn(eventloop: rumqttc::EventLoop, ready: oneshot::Sender<()>) -> Connection {
+        let retiring = Arc::new(AtomicBool::new(false));
+        Connection {
+            task: tokio::spawn(mqtt::pump(eventloop, Some(ready), Arc::clone(&retiring))),
+            retiring,
+        }
+    }
+
+    /// This connection is being replaced. Nothing changes except how loudly it
+    /// reports the close it is about to be asked for.
+    fn retire(&self) {
+        self.retiring.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop the task now. Idempotent, and `Drop` does the same, so calling it
+    /// early is only ever a matter of timing.
+    fn stop(&self) {
+        self.task.abort();
+    }
+}
+
+/// Aborted on drop, including when the task holding it is aborted.
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -393,7 +423,7 @@ async fn supervise(
     store: state::Store,
     pin: Pin,
     config: Config,
-    mut polling: Abort,
+    mut polling: Connection,
     mut handovers: mpsc::Receiver<()>,
 ) {
     while handovers.recv().await.is_some() {
@@ -417,6 +447,9 @@ async fn supervise(
         // this window resolves through the cell, lands in the new client's
         // queue, and goes out as soon as the loop starts. Swapping afterwards
         // would send it through a connection that is about to be torn down.
+        // Tell the outgoing loop first, so the close it is about to see reads
+        // as the handover it is rather than as a fault.
+        polling.retire();
         let previous = cell.swap(Arc::new(client));
         let _ = previous.disconnect().await;
         // The old loop is still polling, which is what puts the DISCONNECT on
@@ -432,7 +465,7 @@ async fn supervise(
         polling.stop();
 
         let (ready, connected) = oneshot::channel();
-        polling = Abort(tokio::spawn(mqtt::pump(eventloop, Some(ready))));
+        polling = Connection::spawn(eventloop, ready);
         if tokio::time::timeout(HANDOFF_TIMEOUT, connected)
             .await
             .is_err()

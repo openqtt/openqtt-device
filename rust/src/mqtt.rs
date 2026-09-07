@@ -1,6 +1,7 @@
 //! The broker connection: one pinned root, one client certificate, and the
 //! handful of options that each exist because something broke in the field.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -187,7 +188,18 @@ pub fn check_topic(topic: &str) -> Result<()> {
 /// connection, and 5s turns a sub-second event into a five second gap in the
 /// data. Going below 500ms buys nothing, because rumqttc rate limits its own
 /// reconnects, and costs CPU when the failure is permanent.
-pub async fn pump(mut eventloop: EventLoop, mut ready: Option<oneshot::Sender<()>>) {
+///
+/// `retiring` is set when this connection is being replaced by a renewed one.
+/// It changes nothing except the log level, and that is the point: a handover
+/// asks the broker to close, so this loop sees the close it asked for. Without
+/// the flag every device logs a connection error at WARN once a day, for the
+/// most routine thing it does, and a log that cries wolf daily is one nobody
+/// reads on the day it matters.
+pub async fn pump(
+    mut eventloop: EventLoop,
+    mut ready: Option<oneshot::Sender<()>>,
+    retiring: Arc<AtomicBool>,
+) {
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
@@ -197,6 +209,10 @@ pub async fn pump(mut eventloop: EventLoop, mut ready: Option<oneshot::Sender<()
                 }
             }
             Ok(_) => {}
+            Err(error) if retiring.load(Ordering::Relaxed) => {
+                tracing::debug!(%error, "the replaced connection closed, as asked");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             Err(error) => {
                 // A certificate problem reads as a plain connection error here
                 // rather than as anything typed, so say enough that the log
