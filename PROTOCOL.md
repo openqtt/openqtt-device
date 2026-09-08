@@ -60,8 +60,20 @@ a distribution point and never a trust anchor.
 diagnostic is an act, not a state, and a retained message is redelivered on every
 reconnect, so a device that renews its certificate daily would re-run
 diagnostics forever. The device records the last `run_id` it answered and
-ignores a repeat. It also clears the retained message when it finishes, so the
-run id only has to cover the gap between finishing and the clear landing.
+ignores a repeat.
+
+**The PLATFORM clears this topic, on seeing the results arrive, and the device
+never does.** An earlier draft of this file asked the device to clear it, which
+contradicts the rule two sections down: a device is denied the retain flag so
+that the retained store cannot become control-plane state a device writes to,
+and clearing a retained topic means writing to it with that flag. The invariant
+is the one worth keeping. The platform published this dispatch, is already
+subscribed to the results, and is the side allowed to retain.
+
+That makes the recorded `run_id` the whole of the deduplication rather than a
+cover for the gap before a clear lands. It has to be on disk before the results
+are believed, because a clear that is slow, lost, or never sent must not cost a
+second run.
 
 Retained is what makes this a queue: a device that is switched off for a week
 gets its diagnostics on the next connect, which is the case that matters,

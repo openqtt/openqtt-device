@@ -44,8 +44,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// returns a log file cannot push the packet past what the broker accepts.
 const MAX_MESSAGE: usize = 256;
 
-/// Where the platform asks, and where the answers go.
-pub(crate) const DISPATCH_TOPIC: &str = "commands/test";
+/// Where the answers go. The question arrives on `commands/test`, which this
+/// module never writes to: see [`answer`].
 const RESULT_TOPIC: &str = "test/result";
 
 /// How a probe answered.
@@ -307,12 +307,18 @@ pub(crate) async fn run(probe: &Probe) -> Answer {
 
 /// Answer a dispatch: one `test/result` per probe, then remember the run.
 ///
-/// THE RUN ID IS RECORDED BEFORE THE RETAINED MESSAGE IS CLEARED, and the order
-/// is the whole reason both exist. The clear is what stops the dispatch coming
-/// back on the next connect; the recorded id is what makes it harmless if it
-/// does, whether because the clear was denied by the ACL, or lost with the
-/// connection, or simply overtaken by a reconnect. Recording after clearing
-/// would leave exactly the window this is meant to close.
+/// THE RECORDED RUN ID IS THE WHOLE OF THE DEDUPLICATION, because the retained
+/// dispatch is not this device's to clear. Clearing it means publishing zero
+/// bytes to `commands/test` with the retain flag, and a device is refused that
+/// flag precisely so the retained store cannot become control-plane state a
+/// device writes to. An earlier version of this did it anyway and called the
+/// invariant an awkward corner; it is the other way round.
+///
+/// So the platform clears `commands/test` when it sees the results arrive. It
+/// is already subscribed to them, it is the side that published the dispatch,
+/// and it is the side allowed to retain. What this device owes is the run id on
+/// disk, which is what makes a redelivery a no-op however long the clear takes
+/// or whether it happens at all.
 pub(crate) async fn answer(
     publisher: &Publisher,
     registry: &Registry,
@@ -363,9 +369,6 @@ pub(crate) async fn answer(
             run_id = %dispatch.run_id,
             "could not record which diagnostic run was answered; a redelivery will run it again"
         );
-    }
-    if let Err(error) = publisher.clear(DISPATCH_TOPIC).await {
-        tracing::debug!(%error, "could not clear the retained dispatch");
     }
 }
 
@@ -588,10 +591,12 @@ mod probes {
     }
 
     #[tokio::test]
-    async fn the_run_is_recorded_before_the_retained_dispatch_is_cleared() {
-        // The clear can be denied by the ACL and arrives as silence when it
-        // is. What actually stops a redelivery from running everything twice
-        // is the recorded id, so it has to be on disk first.
+    async fn the_run_is_recorded_and_nothing_retained_goes_out() {
+        // The dispatch is not this device's to clear: that would mean writing
+        // to the retained store with the flag a device is denied on purpose.
+        // What stops a redelivery from running everything twice is the run id
+        // on disk, and it has to be there whether or not the platform has got
+        // round to clearing anything.
         let (publisher, sent) = crate::mqtt::spy::publisher();
         let home = tempfile::tempdir().unwrap();
         let journal = journal::Store::beside(&home.path().join("state.json"));
@@ -614,10 +619,14 @@ mod probes {
             journal.load().unwrap().answered.as_deref(),
             Some("0f9b2c1e")
         );
-        let last = crate::mqtt::spy::published(&sent).pop().unwrap();
-        assert_eq!(last.0, DISPATCH_TOPIC, "the clear goes out last");
-        assert!(last.1.is_empty(), "a clear is zero bytes");
-        assert!(last.2, "and it is the one thing this crate retains");
+
+        let sent = crate::mqtt::spy::published(&sent);
+        assert_eq!(sent.len(), 1, "one result and nothing else");
+        assert_eq!(sent[0].0, RESULT_TOPIC);
+        assert!(
+            sent.iter().all(|(_, _, retained)| !retained),
+            "a device is denied the retain flag, so nothing here may ask for it"
+        );
     }
 
     #[tokio::test]

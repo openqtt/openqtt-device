@@ -183,6 +183,14 @@ A timeout does not stop a probe, because a blocking thread cannot be cancelled.
 The bound exists so that a probe which never returns costs a thread rather than
 the connection.
 
+A dispatch is the one imperative message in the protocol, so it carries a run
+id and the device writes down the last one it answered. That is the whole of
+the deduplication: the platform clears the retained dispatch when it sees the
+results, and the device never touches it. Clearing a retained topic means
+writing to it with the retain flag, and a device is denied that flag precisely
+so the retained store cannot become control-plane state a device writes to. So
+the run id has to be on disk whether the clear is fast, slow, or never comes.
+
 There are five outcomes and not two. `timeout` means the state of the device is
 not known, which is different from failing, and must not revert firmware on its
 own. `not_registered` means the manifest declared a test this binary does not

@@ -185,10 +185,11 @@ async fn diagnostics(worker: &Worker, payload: &[u8]) {
             return;
         }
     };
-    // THE RECORDED RUN ID IS WHAT MAKES A REDELIVERY HARMLESS. The retained
-    // message is cleared when a run finishes, but the clear can be lost, denied
-    // or overtaken by a reconnect, and running every probe again because a
-    // certificate was renewed is exactly what this protects against.
+    // THE RECORDED RUN ID IS WHAT MAKES A REDELIVERY HARMLESS. The platform
+    // clears the retained dispatch when it sees the results, because a device
+    // is denied the retain flag and this one is not going to be the exception.
+    // Until that clear lands, and if it never does, this is what stops every
+    // probe running again because a certificate was renewed.
     match worker.journal.load() {
         Ok(held) if held.answered.as_deref() == Some(dispatch.run_id.as_str()) => {
             tracing::debug!(run_id = %dispatch.run_id, "already answered this run");

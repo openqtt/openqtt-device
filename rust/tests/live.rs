@@ -59,13 +59,11 @@
 //!
 //! NOT MEASURED, AND OWED. `commands/#` was added after that run and the ACL
 //! that has to allow it is the platform's. What is still unproven against a
-//! real broker: that `ingest/${username}/commands/#` is accepted, that a
-//! device is still refused `#` and another device's commands, and whether a
-//! device may clear the retained dispatch on `commands/test` or is denied the
-//! retain flag there as it is everywhere else. The last one is not a
-//! correctness question, because the run id in the journal is what stops a
-//! redelivery from running twice, but it decides whether a device that has
-//! answered its diagnostics keeps being handed them.
+//! real broker: that `ingest/${username}/commands/#` is accepted, and that a
+//! device is still refused `#` and another device's commands. Nothing else
+//! about the ACL changed, because a device still publishes nothing retained:
+//! the platform clears the dispatch it published, and this device's only duty
+//! is the run id on disk.
 //!
 //! certificate handover, forced by shortening the renewal
 //!   -> five consecutive handovers, one connect each

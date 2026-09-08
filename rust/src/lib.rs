@@ -265,9 +265,7 @@ impl Device {
         payload: impl Into<Vec<u8>>,
         qos: QoS,
     ) -> Result<()> {
-        self.publisher
-            .bytes(topic, payload.into(), qos, false)
-            .await
+        self.publisher.bytes(topic, payload.into(), qos).await
     }
 
     /// Disconnect cleanly and stop renewing.

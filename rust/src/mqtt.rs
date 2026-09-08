@@ -39,14 +39,20 @@ impl Publisher {
 
     /// Publish a JSON body at least once, never retained.
     ///
-    /// Not retained because the broker refuses it: see [`Publisher::clear`].
+    /// NEVER RETAINED, AND THERE IS NO WAY TO ASK FOR IT. A device is refused
+    /// the retain flag on everything it publishes, so that the retained store
+    /// never becomes control-plane state a device can write to. That invariant
+    /// is worth more than any convenience it costs, so this crate does not own
+    /// a code path that sets the flag at all: one that existed and went unused
+    /// is what somebody wires back up in a year.
     pub async fn json(&self, topic: &str, body: &serde_json::Value) -> Result<()> {
         let payload = serde_json::to_vec(body)
             .map_err(|error| Error::Crypto(format!("could not encode the payload: {error}")))?;
-        self.bytes(topic, payload, QoS::AtLeastOnce, false).await
+        self.bytes(topic, payload, QoS::AtLeastOnce).await
     }
 
-    pub async fn bytes(&self, topic: &str, payload: Vec<u8>, qos: QoS, retain: bool) -> Result<()> {
+    /// `retain` is always false and is not a parameter: see [`Publisher::json`].
+    pub async fn bytes(&self, topic: &str, payload: Vec<u8>, qos: QoS) -> Result<()> {
         check_topic(topic)?;
         // THE LIMIT IS ON THE PACKET AND NOT ON THE PAYLOAD, so the topic and
         // the header have to be counted too. Comparing the payload alone
@@ -67,25 +73,9 @@ impl Publisher {
         // certificate handover invisible to the caller.
         self.client
             .load()
-            .publish(topic, qos, retain, payload)
+            .publish(topic, qos, false, payload)
             .await?;
         Ok(())
-    }
-
-    /// Clear a retained message the PLATFORM published, by publishing zero
-    /// bytes over it.
-    ///
-    /// THE ONE PLACE IN THIS CRATE THAT SETS THE RETAIN FLAG, AND IT MAY WELL
-    /// BE DENIED. A device is refused the retain flag on everything it
-    /// publishes, so that the retained store never becomes control-plane state
-    /// a device can write to, and `deny_action = ignore` means a refusal
-    /// arrives as silence rather than as an error. So this is an optimisation
-    /// and never a correctness requirement: what actually stops a redelivered
-    /// dispatch from running twice is the run id in the journal, written
-    /// before this is attempted. If the clear lands, the redelivery never
-    /// happens; if it does not, the redelivery is a no-op.
-    pub async fn clear(&self, topic: &str) -> Result<()> {
-        self.bytes(topic, Vec::new(), QoS::AtLeastOnce, true).await
     }
 
     /// Ask the live connection to close. Used by shutdown and by the restart
