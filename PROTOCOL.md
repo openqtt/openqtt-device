@@ -142,6 +142,19 @@ the stall timer.
 `state` is one of `started`, `succeeded`, `failed`, `rolled_back`. Terminal.
 `message` carries the probe message when a gating test caused the rollback.
 
+**There is deliberately no `restarting` state, and the device announces its
+departure on `status/updating` instead.** Installing an update means the process
+goes away, and something has to say so before it does or the console cannot tell
+an update from a crash. That is a statement about what the device is doing,
+which is what `status/` is for, and `status/updating { at, to }` already says
+exactly it. Adding a fourth `ota/event` state to say the same thing would give
+two topics one meaning and make the set of terminal outcomes no longer terminal.
+
+So the order before exit is: `ota/event started` when the update is accepted,
+then the download and the swap, then `status/updating` as the last thing on the
+wire, then a clean DISCONNECT. The intent has to precede the disconnect because
+the broker tears the session down and anything published after it is dropped.
+
 ### `test/result`, one per probe
 
 ```json
