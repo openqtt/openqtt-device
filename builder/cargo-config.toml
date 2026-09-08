@@ -1,0 +1,13 @@
+# Which linker cargo uses per target. Read the reasoning in the Dockerfile.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+# Fetch with the git CLI rather than cargo's own implementation. Large
+# dependency trees over a cold network are where cargo's built-in fetcher is
+# slowest, and a build minute is billed.
+[net]
+git-fetch-with-cli = true
