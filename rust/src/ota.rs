@@ -350,7 +350,7 @@ impl Updater {
         self.download(publisher, announced, &digest).await?;
 
         progress(publisher, &announced.version, "applying", 100).await;
-        let previous = self.running.sha256.clone();
+        let previous = (self.running.sha256.clone(), self.running.version.clone());
         // THE MARKER GOES DOWN BEFORE THE RENAMES. It is the only thing that
         // makes the gap between them recoverable: with it, whatever comes up
         // next knows which binary was supposed to be running and which one to
@@ -360,7 +360,7 @@ impl Updater {
             journal.probation = Some(Probation::new(
                 &announced.version,
                 &announced.sha256,
-                &previous,
+                previous.clone(),
                 PROBATION_WINDOW,
             ));
         })?;
@@ -459,6 +459,10 @@ impl Updater {
 
             if written - announced_at >= PROGRESS_STEP {
                 announced_at = written;
+                // Zero when the server did not say how large the artifact is.
+                // Progress is what resets the platform's stall timer, and a
+                // message that arrives is what does that; the number on it is
+                // advisory and a wrong one would be worse than none.
                 let percent = total.map_or(0, |length| {
                     (written.saturating_mul(100) / length.max(1)).min(100)
                 });
@@ -834,7 +838,7 @@ async fn revert(
     )
     .await;
     Next::Restart {
-        into: proving.previous_sha256.clone(),
+        into: proving.previous_version.clone(),
     }
 }
 
@@ -1425,7 +1429,7 @@ mod tests {
                 journal.probation = Some(Probation::new(
                     "1.4.0",
                     "aaaa",
-                    &bench.updater.running.sha256,
+                    (bench.updater.running.sha256.clone(), "1.3.0"),
                     PROBATION_WINDOW,
                 ));
             })
@@ -1477,7 +1481,7 @@ mod tests {
             probation: Some(Probation::new(
                 "1.4.0",
                 candidate,
-                previous,
+                (previous, "1.3.0"),
                 PROBATION_WINDOW,
             )),
             ..Journal::default()
@@ -1567,7 +1571,14 @@ mod tests {
         }));
 
         let next = settle(&mut bench.updater, &publisher, &probes).await;
-        assert!(matches!(next, Next::Restart { .. }));
+        // Named rather than hashed: this is what goes out on `status/updating`
+        // before the device leaves, and a person reads it.
+        assert_eq!(
+            next,
+            Next::Restart {
+                into: "1.3.0".to_string()
+            }
+        );
         assert_eq!(
             std::fs::read(&bench.paths.binary).unwrap(),
             b"the firmware that is running"

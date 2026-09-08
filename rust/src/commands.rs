@@ -1,9 +1,10 @@
 //! What the platform asks for, and what answers it.
 //!
-//! A DEVICE SUBSCRIBES NOW, AND IT DID NOT USED TO. The broker denied every
-//! subscribe on the grounds that this is a one directional client, and that
-//! sentence is in this crate's history and in the README. It stops being true
-//! at exactly one filter: `commands/#`, mounted by the broker under this
+//! A DEVICE SUBSCRIBES NOW, AND FOR MOST OF THIS CRATE'S LIFE IT COULD NOT.
+//! The broker denied every subscribe on the grounds that this is a one
+//! directional client, and that sentence is still in the README because
+//! deleting it would hide the change rather than explain it. It stops being
+//! true at exactly one filter: `commands/#`, mounted by the broker under this
 //! device's own prefix, so a device can be told things about itself and about
 //! nothing else. Reading other devices' data back out is still a job for a
 //! consumer with its own credential.

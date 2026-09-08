@@ -66,6 +66,11 @@ pub(crate) struct Probation {
     /// The sha of what `<binary>.old` holds, so a rollback can be checked
     /// rather than assumed.
     pub previous_sha256: String,
+    /// What that binary called itself. Kept because a rollback has to say
+    /// where it is going, and a person reads "1.3.0" where a digest tells them
+    /// only that something happened.
+    #[serde(default)]
+    pub previous_version: String,
     /// The api's clock is not available here, so this is the local one. It is
     /// kept for the same reason `state::State::issued_at` is: a clock reading
     /// earlier than an instant that has demonstrably passed is a clock that
@@ -100,14 +105,15 @@ impl Probation {
     pub fn new(
         version: impl Into<String>,
         sha256: impl Into<String>,
-        previous_sha256: impl Into<String>,
+        previous: (impl Into<String>, impl Into<String>),
         window: TimeDelta,
     ) -> Probation {
         let started_at = Utc::now();
         Probation {
             version: version.into(),
             sha256: sha256.into(),
-            previous_sha256: previous_sha256.into(),
+            previous_sha256: previous.0.into(),
+            previous_version: previous.1.into(),
             started_at,
             deadline: started_at + window,
             attempts: 0,
@@ -177,7 +183,7 @@ mod tests {
     use super::*;
 
     fn probation() -> Probation {
-        Probation::new("1.4.0", "aaaa", "bbbb", TimeDelta::hours(1))
+        Probation::new("1.4.0", "aaaa", ("bbbb", "1.3.0"), TimeDelta::hours(1))
     }
 
     #[test]
