@@ -293,6 +293,9 @@ async fn fixture(push: Option<(String, Vec<u8>)>) -> Fixture {
         root_ca: root,
         state: home.path().join("openqtt").join("state.json"),
         artifact_key: home.path().join("artifact-key.pem"),
+        // Loopback, so nothing here can reach a real endpoint even if a
+        // flush fires while a test is running.
+        logs: "http://127.0.0.1:1/v1/logs".to_string(),
         connect_timeout: Duration::from_secs(10),
     };
     Fixture {
