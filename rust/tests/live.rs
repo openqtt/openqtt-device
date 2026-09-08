@@ -57,13 +57,40 @@
 //! the same device subscribes to `#`            -> denied
 //! no client certificate at all                 -> connection refused
 //!
-//! NOT MEASURED, AND OWED. `commands/#` was added after that run and the ACL
-//! that has to allow it is the platform's. What is still unproven against a
-//! real broker: that `ingest/${username}/commands/#` is accepted, and that a
-//! device is still refused `#` and another device's commands. Nothing else
-//! about the ACL changed, because a device still publishes nothing retained:
-//! the platform clears the dispatch it published, and this device's only duty
-//! is the run id on disk.
+//! 2026-09-08, the command channel, against the same digest with the ACL from
+//! `infra` branch `broker/commands-and-storage` and 1883 authenticated. The
+//! state file was seeded from the throwaway CA with a renewal date two days
+//! out, so this ran the real crate and never called the api at all.
+//!
+//! ```text
+//! a retained commands/test was published BEFORE the device started, as
+//! ctl.platform, which is the offline queue this design rests on
+//!
+//! the device connects
+//!   -> ingest/acme/production/pump-3/meta/firmware
+//!        {"sha256":"97ebb0f2...","version":"1.0.0"}
+//!   -> ingest/acme/production/pump-3/temperature 21.5
+//!   -> the retained dispatch arrives on CONNACK and both probes answer
+//!        test/result {"run_id":"0f9b2c1e","test_id":"sd_card","status":"pass",
+//!                     "message":"mounted, 3.1 GB free"}
+//!        test/result {"run_id":"0f9b2c1e","test_id":"gps","status":"fail",
+//!                     "message":"no fix, indoors"}
+//!
+//! the SAME device started again, dispatch still retained because the platform
+//! had not cleared it
+//!   -> journal.json says answered: "0f9b2c1e"
+//!   -> zero test/result messages
+//! ```
+//!
+//! That second run is the one worth keeping. It is the property that makes a
+//! retained queue safe rather than a device that re-runs its diagnostics on
+//! every reconnect for the rest of its life, and it fails silently if it ever
+//! regresses: the symptom is noise, not an error.
+//!
+//! STILL OWED, and it is the platform's ACL rather than this crate: that a
+//! device is refused `#` and refused another device's commands. Both were
+//! measured with mosquitto against the same broker and are recorded in
+//! `infra`, but not from this crate.
 //!
 //! certificate handover, forced by shortening the renewal
 //!   -> five consecutive handovers, one connect each
