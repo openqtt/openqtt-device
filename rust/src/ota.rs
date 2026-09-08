@@ -1799,6 +1799,66 @@ mod tests {
         );
     }
 
+    /// THE PLATFORM'S SIGNING CONVENTION, PINNED AGAINST THE PRODUCTION KEY.
+    ///
+    /// The fixture below was produced by the real HSM key,
+    /// `pki/artifact-signing` version 1 in `openqtt-prod`, over a real device
+    /// binary. It is here because the convention is not obvious and getting it
+    /// wrong is invisible until a fleet refuses an update.
+    ///
+    /// `verify` hands `digest`, the 32 raw sha256 bytes, to
+    /// `UnparsedPublicKey::verify` as its MESSAGE, and that call hashes its
+    /// message. So the value the curve actually signs is `sha256(sha256(bin))`,
+    /// and Cloud KMS, which signs a pre-computed digest without hashing again,
+    /// must be handed the double hash.
+    ///
+    /// A first draft of the platform side had this inverted and would have
+    /// signed `sha256(bin)`. Every artifact would have looked correctly signed
+    /// and every device would have refused it, reporting what reads like the
+    /// wrong key. This test fails if either side ever drifts.
+    ///
+    /// ONE MORE TRAP, MET WHILE MAKING THIS FIXTURE. `gcloud kms
+    /// asymmetric-sign --digest-algorithm sha256 --input-file F` HASHES F; it
+    /// does not treat F as a pre-computed digest. So reproducing this by hand
+    /// means handing it `sha256(bin)` and letting it hash once, while the api
+    /// calls the KMS API with a Digest message and must pass the double hash
+    /// itself. Same signature, two different inputs, and feeding gcloud the
+    /// double hash silently signs a triple one.
+    #[test]
+    fn the_platform_signs_what_this_device_verifies() {
+        let home = tempfile::tempdir().unwrap();
+        let key = home.path().join("artifact-key.pem");
+        std::fs::write(&key, PRODUCTION_ARTIFACT_KEY).unwrap();
+
+        let digest = unhex(ARTIFACT_SHA256).expect("the fixture digest is hex");
+        let signature = unbase64(PRODUCTION_SIGNATURE).expect("the fixture signature is base64");
+
+        verify(&key, &digest, &signature)
+            .expect("the production key signs what this device verifies");
+
+        // And the same signature against a digest one bit different is refused,
+        // so the test above is not passing for some reason other than the maths.
+        let mut wrong = digest.clone();
+        wrong[0] ^= 0x01;
+        assert!(verify(&key, &wrong, &signature).is_err());
+    }
+
+    /// The public half of `pki/artifact-signing` version 1. Public by
+    /// definition: the private half has never left Cloud KMS and cannot.
+    const PRODUCTION_ARTIFACT_KEY: &str = "\
+-----BEGIN PUBLIC KEY-----\n\
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEglLqjc7my/XBvg6sTRRE/OD3B0AO\n\
+yp3pqun9aUO9CpufgZkRA9Rf9OuZHwqLxAK+KcLrF+kjRm9hCqbAYgyG6w==\n\
+-----END PUBLIC KEY-----";
+
+    /// DER, produced by that key over sha256(sha256(binary)).
+    const PRODUCTION_SIGNATURE: &str = "MEUCIQDFiHIgYuc69vIOILRCkWUKXTyZZ8iYdVoDSz3GRZSs0AIgT/bsMS17sLy1y1p6uLRKqm7IgbX+hB5TNY0NxOZDuaY=";
+
+    /// The artifact those bytes are about: the aarch64 build of the reference
+    /// device, from the builder image.
+    const ARTIFACT_SHA256: &str =
+        "e65697531db32dff8ed487eb9256513d57c88f18458aa1921a0493cf69b881ca";
+
     #[test]
     fn a_signing_key_file_may_hold_several_and_never_none() {
         let home = tempfile::tempdir().unwrap();
