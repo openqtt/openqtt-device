@@ -119,6 +119,7 @@ pub(crate) async fn task(
     mut state: State,
     mut wait: Duration,
     renewed: mpsc::Sender<()>,
+    asked: mpsc::Receiver<DateTime<Utc>>,
 ) {
     // A response that arrived but has not reached the disk yet. IT IS NEVER
     // THROWN AWAY AND NEVER RE-REQUESTED. Asking again after a failed write
@@ -126,10 +127,13 @@ pub(crate) async fn task(
     // doing that twice ends its life on the platform. So a write that fails is
     // retried as a WRITE, with the same response, for as long as it takes.
     let mut unsaved: Option<(State, Duration)> = None;
+    // `commands/certificate`, for a compromised intermediate, where waiting out
+    // the renewal jitter is not acceptable. Dropped once the device is gone.
+    let mut asked = Some(asked);
 
     loop {
         tracing::debug!(seconds = wait.as_secs(), "next certificate renewal");
-        tokio::time::sleep(wait).await;
+        wait_out(wait, &state, &mut asked).await;
 
         let mut attempt = 0u32;
         loop {
@@ -171,6 +175,52 @@ pub(crate) async fn task(
                 return;
             }
             break;
+        }
+    }
+}
+
+/// Sleep until the renewal is due, or until the platform says not to.
+///
+/// A DEADLINE AND NOT A DURATION, so an instruction that turns out not to apply
+/// costs nothing. `commands/certificate` is retained and redelivered on every
+/// reconnect, so a device that reset its own schedule each time one arrived
+/// would renew on every reconnect, which is the fleet-wide request storm the
+/// jitter exists to prevent. Comparing against `issued_at` is the same
+/// desired-state test the firmware announcement uses: the instruction says
+/// "have a certificate issued after this instant", and a device that already
+/// has one goes back to waiting for exactly as long as was left.
+async fn wait_out(
+    wait: Duration,
+    state: &State,
+    asked: &mut Option<mpsc::Receiver<DateTime<Utc>>>,
+) {
+    let due = tokio::time::Instant::now() + wait;
+    loop {
+        let instruction = match asked.as_mut() {
+            Some(channel) => tokio::select! {
+                () = tokio::time::sleep_until(due) => return,
+                instruction = channel.recv() => instruction,
+            },
+            // Nothing can ask any more, so there is only the clock.
+            None => {
+                tokio::time::sleep_until(due).await;
+                return;
+            }
+        };
+        match instruction {
+            None => *asked = None,
+            Some(not_before) if state.issued_at < not_before => {
+                tracing::warn!(
+                    not_before = %not_before,
+                    issued_at = %state.issued_at,
+                    "the platform asked for a certificate newer than the one on disk"
+                );
+                return;
+            }
+            Some(not_before) => tracing::debug!(
+                not_before = %not_before,
+                "the certificate on disk is already newer than that"
+            ),
         }
     }
 }

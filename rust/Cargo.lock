@@ -1058,6 +1058,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "aws-lc-rs",
+ "bytes",
  "chrono",
  "flume",
  "rand",

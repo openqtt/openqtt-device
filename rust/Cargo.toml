@@ -63,6 +63,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-
 # the requests a publish would have put on the wire. Same version rumqttc
 # resolves to, or the `Sender<Request>` it wants is a different type.
 flume = { version = "0.11", default-features = false, features = ["async"] }
+# The buffer rumqttc's own packet codec reads and writes, so `tests/connection.rs`
+# can answer a CONNECT without reimplementing MQTT framing.
+bytes = "1"
 wiremock = "0.6"
 tempfile = "3"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs", "x509-parser"] }  # x509-parser: the test mock signs the device's real CSR

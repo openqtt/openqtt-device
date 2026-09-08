@@ -57,6 +57,16 @@
 //! the same device subscribes to `#`            -> denied
 //! no client certificate at all                 -> connection refused
 //!
+//! NOT MEASURED, AND OWED. `commands/#` was added after that run and the ACL
+//! that has to allow it is the platform's. What is still unproven against a
+//! real broker: that `ingest/${username}/commands/#` is accepted, that a
+//! device is still refused `#` and another device's commands, and whether a
+//! device may clear the retained dispatch on `commands/test` or is denied the
+//! retain flag there as it is everywhere else. The last one is not a
+//! correctness question, because the run id in the journal is what stops a
+//! redelivery from running twice, but it decides whether a device that has
+//! answered its diagnostics keeps being handed them.
+//!
 //! certificate handover, forced by shortening the renewal
 //!   -> five consecutive handovers, one connect each
 //!   -> ten messages delivered across them with no gap in the consumer
@@ -116,11 +126,20 @@ async fn a_device_enrols_connects_and_publishes() {
 
 #[tokio::test]
 #[ignore = "needs a real broker and a real device"]
-async fn a_device_cannot_subscribe() {
-    // The ACL denies every subscribe and the crate offers no way to try, so
-    // this asserts the shape of the product rather than the behaviour of the
-    // broker: there is no `subscribe` on `Device`, and adding one would need
-    // the broker rules to change first.
+async fn a_device_subscribes_to_commands_and_to_nothing_else() {
+    // THIS TEST USED TO ASSERT THE OPPOSITE and the change is the product's,
+    // not this crate's: the ACL now allows `ingest/${username}/commands/#` and
+    // still denies everything else. The device subscribes on its own, on every
+    // CONNACK, so there is nothing to call here; what has to be confirmed by
+    // hand against the real broker is what the ACL does with the two
+    // subscriptions this crate never sends.
+    //
+    //   mosquitto_sub with this device's certificate on `#`            -> denied
+    //   the same on another device's `ingest/<other>/commands/#`       -> denied
+    //
+    // The connection below reaching CONNACK is what says the allowed one was
+    // accepted: a denied subscribe with `deny_action = ignore` is silence, so
+    // the only honest check is on the broker's own log.
     let device = Device::with_config(live()).await.expect("connect");
     device.shutdown().await;
 }

@@ -226,10 +226,6 @@ impl Registry {
     pub fn gating(&self) -> impl Iterator<Item = &Probe> {
         self.probes.iter().filter(|probe| probe.gating)
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.probes.is_empty()
-    }
 }
 
 /// What the platform sends to `commands/test`.
@@ -399,8 +395,10 @@ fn trimmed(mut message: String) -> String {
     message
 }
 
+// Named for what it tests rather than `tests`, because this module is already
+// called that and the nesting reads as a mistake.
 #[cfg(test)]
-mod tests {
+mod probes {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

@@ -14,7 +14,7 @@ use rumqttc::tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use rumqttc::{
     AsyncClient, Event, EventLoop, MqttOptions, Outgoing, Packet, QoS, TlsConfiguration, Transport,
 };
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::config::BrokerTransport;
 use crate::error::{Error, Result};
@@ -260,9 +260,14 @@ pub fn options(
 
     // A resumed session delivers pubacks for packet ids the new session never
     // sent. rumqttc calls that an "Unsolicited puback packet", errors, and
-    // reconnects, which is a loop rather than an incident. Nothing is lost by
-    // starting clean: the ACL denies every subscribe, so there is no
-    // subscription to restore.
+    // reconnects, which is a loop rather than an incident.
+    //
+    // THE PRICE IS THAT NO SUBSCRIPTION SURVIVES A RECONNECT, and paying it
+    // knowingly is why `connected` exists: every fresh CONNACK subscribes
+    // again. This used to say there was nothing to restore, which was true
+    // while a device could not subscribe at all. A clean session that silently
+    // dropped `commands/#` would leave a device connected, publishing happily,
+    // and deaf.
     options.set_clean_session(true);
     options.set_max_packet_size(MAX_PACKET, MAX_PACKET);
 
@@ -342,6 +347,46 @@ pub fn check_topic(topic: &str) -> Result<()> {
     Ok(())
 }
 
+/// What every fresh connection does before it is any use.
+///
+/// A STRUCT AND NOT A PAIR OF ARGUMENTS, so that a connection cannot be built
+/// without one. There are two places a connection is created, the first one and
+/// the replacement a certificate handover brings up, and the second is the one
+/// that gets forgotten: a device would work perfectly for a day and then stop
+/// receiving commands, silently, which is the worst shape a bug can take.
+pub struct Wiring {
+    /// `meta/firmware`, already encoded. Ground truth, on every connect,
+    /// because the process that would have announced an update's success was
+    /// replaced mid-sentence.
+    pub firmware: Option<Vec<u8>>,
+    /// Where a delivery on `commands/#` goes.
+    pub commands: mpsc::Sender<crate::commands::Delivery>,
+}
+
+/// Subscribe and announce, on every CONNACK.
+///
+/// `try_` AND NOT `await`, AND THAT IS A DEADLOCK AND NOT A STYLE. This runs on
+/// the task that drains rumqttc's request queue, so awaiting a send into that
+/// same queue when it is full waits for a drain that cannot happen until this
+/// returns. The queue is 256 deep and this is the first thing after a CONNACK,
+/// so a refusal here means something is very wrong and says so.
+pub fn connected(client: &AsyncClient, wiring: &Wiring) {
+    if let Err(error) = client.try_subscribe(crate::commands::FILTER, QoS::AtLeastOnce) {
+        tracing::error!(
+            %error,
+            filter = crate::commands::FILTER,
+            "this connection could not subscribe, so it will not be told anything"
+        );
+    }
+    if let Some(firmware) = &wiring.firmware {
+        if let Err(error) =
+            client.try_publish("meta/firmware", QoS::AtLeastOnce, false, firmware.clone())
+        {
+            tracing::warn!(%error, "could not report what firmware this device is running");
+        }
+    }
+}
+
 /// Poll the connection forever, telling `ready` about the first CONNACK.
 ///
 /// rumqttc reconnects on its own as long as something keeps polling, so the
@@ -364,17 +409,40 @@ pub fn check_topic(topic: &str) -> Result<()> {
 /// two different callers wait on it, a handover and a shutdown, and each
 /// connection is only ever asked to disconnect once.
 pub async fn pump(
+    client: AsyncClient,
     mut eventloop: EventLoop,
     mut ready: Option<oneshot::Sender<()>>,
     flushed: Arc<Notify>,
     retiring: Arc<AtomicBool>,
+    wiring: Arc<Wiring>,
 ) {
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 tracing::info!("connected to the broker");
+                // EVERY CONNACK AND NOT ONLY THE FIRST. The session is clean,
+                // so a reconnect starts with no subscriptions at all, and a
+                // handover is a whole new client that never had any.
+                connected(&client, &wiring);
                 if let Some(sender) = ready.take() {
                     let _ = sender.send(());
+                }
+            }
+            Ok(Event::Incoming(Packet::Publish(publish))) => {
+                // OFF THIS TASK IMMEDIATELY. What answers a command downloads
+                // firmware and runs customer code, and doing either here stops
+                // the keepalive: the broker drops a client at keepalive times
+                // 1.5, so a device would go offline while busy doing what it
+                // was told.
+                let delivery = crate::commands::Delivery {
+                    topic: publish.topic,
+                    payload: publish.payload.to_vec(),
+                };
+                if let Err(error) = wiring.commands.try_send(delivery) {
+                    // Every command is retained, so a dropped one comes back on
+                    // the next connect. Saying so is still worth it: a full
+                    // queue means the worker has been busy for a long time.
+                    tracing::warn!(%error, "a command arrived faster than it could be answered");
                 }
             }
             Ok(Event::Outgoing(Outgoing::Disconnect)) => {

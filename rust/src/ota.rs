@@ -80,7 +80,6 @@ const PROGRESS_STEP: u64 = 5 * 1024 * 1024;
 /// must not be able to hang here.
 const PRE_EXIT_BUDGET: Duration = Duration::from_secs(3);
 
-pub(crate) const ANNOUNCEMENT_TOPIC: &str = "commands/firmware";
 const PROGRESS_TOPIC: &str = "ota/progress";
 const EVENT_TOPIC: &str = "ota/event";
 const META_TOPIC: &str = "meta/firmware";

@@ -127,6 +127,9 @@ impl Store {
         }
     }
 
+    /// Only the tests reach past `load` and `save`; everything else names the
+    /// file through the errors those two return.
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
