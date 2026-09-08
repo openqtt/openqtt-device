@@ -85,7 +85,7 @@ purpose.
 | `OPENQTT_ARTIFACT_KEY` | `/etc/openqtt/artifact-key.pem` | the keys firmware signatures are checked against |
 | `OPENQTT_API` | `https://api.openqtt.com` | must be `https`, or a loopback address |
 | `OPENQTT_BROKER` | `mqtt.broker-yyz.openqtt.com:8883` | `host:port`, `mqtts://...` or `wss://host:port/mqtt` |
-| `OPENQTT_LOGS` | `https://logs.openqtt.com/v1/logs` | where batched log lines go. `https`, or a loopback address |
+| `OPENQTT_LOGS` | `https://logs.broker-yyz.openqtt.com/v1/logs` | where batched log lines go. `https`, or a loopback address |
 | `OPENQTT_CONNECT_TIMEOUT` | `30` | seconds to wait for the first connection |
 
 Nothing is read from a config file, deliberately. A file that fails to parse
