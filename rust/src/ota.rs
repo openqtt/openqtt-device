@@ -231,6 +231,22 @@ impl Updater {
             .user_agent(concat!("openqtt-device/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| Error::Crypto(format!("could not build an https client: {error}")))?;
+        // SAID OUT LOUD AT STARTUP, because the failure this catches is
+        // somebody being sure they installed a key. Not fatal: a device that
+        // cannot be updated should still publish its readings, and the refusal
+        // arrives with a sentence when an update is actually announced.
+        match public_keys(&key) {
+            Ok(keys) => tracing::info!(
+                keys = keys.len(),
+                file = %key.display(),
+                "firmware signing keys loaded"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "no update will be installed until this is fixed"
+            ),
+        }
+
         Ok(Updater {
             paths,
             running,
@@ -907,13 +923,25 @@ async fn event(publisher: &Publisher, version: &str, sha256: &str, state: &str, 
     }
 }
 
-/// One key, checked the way the root certificate is checked.
+/// The keys firmware may be signed by. A SET, and the plural is the whole
+/// point.
 ///
-/// EXACTLY ONE, and a file with two in it is an error rather than a
-/// convenience. This is the anchor that decides what runs on the device, and
-/// quietly accepting a second one because somebody concatenated two files is
-/// how it stops being an anchor.
-fn public_key(path: &Path) -> Result<Vec<u8>> {
+/// ONE KEY IS A ONE-WAY DOOR AND IT IS THE WRONG ONE TO WALK THROUGH. This file
+/// decides what code runs on the device, which makes it the most attractive
+/// thing in the product to steal, and a signing key that can never be replaced
+/// is a signing key that is never replaced. With one key the only way to
+/// install a second is an update, and that update has to be signed by the key
+/// being replaced, so a compromised or lost key strands the whole fleet.
+///
+/// With a set, rotation is an ordinary sequence that needs nothing special:
+/// ship an artifact signed by the old key whose payload adds the new key to
+/// this file, wait for the fleet to converge, start signing with the new one,
+/// and later ship one that drops the old. Every step is signed by something
+/// every device already trusts.
+///
+/// An empty file is still an error. "No keys" and "any key" are one character
+/// apart in a config management system and only one of them is survivable.
+fn public_keys(path: &Path) -> Result<Vec<Vec<u8>>> {
     let pem = std::fs::read_to_string(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             Error::Ota(format!(
@@ -940,33 +968,40 @@ fn public_key(path: &Path) -> Result<Vec<u8>> {
             }
         }
     }
-    match found.len() {
-        1 => Ok(found.remove(0)),
-        0 => Err(Error::Ota(format!(
-            "{} holds no public key. It should hold one PEM block that begins \
-             BEGIN PUBLIC KEY.",
+    if found.is_empty() {
+        return Err(Error::Ota(format!(
+            "{} holds no public key. It should hold at least one PEM block that \
+             begins BEGIN PUBLIC KEY.",
             path.display()
-        ))),
-        many => Err(Error::Ota(format!(
-            "{} holds {many} public keys and it must hold exactly one: this is \
-             the single anchor that decides what runs on this device.",
-            path.display()
-        ))),
+        )));
     }
+    Ok(found)
 }
 
 /// ECDSA P-256 over the raw 32 bytes of the sha256, DER, as the protocol says.
+///
+/// READ AT USE AND NOT CACHED AT STARTUP, so a key installed since this process
+/// booted works without a restart. The count is logged at startup anyway, by
+/// `Updater::new`, because a key file somebody thought they installed should be
+/// visible as wrong long before an update needs it.
 fn verify(key: &Path, digest: &[u8], signature: &[u8]) -> Result<()> {
-    let spki = public_key(key)?;
-    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, spki)
-        .verify(digest, signature)
-        .map_err(|_| {
-            Error::Ota(
-                "the signature over this artifact's digest is not valid for the \
-                 firmware signing key on this device."
-                    .to_string(),
-            )
-        })
+    let keys = public_keys(key)?;
+    let held = keys.len();
+    // ANY OF THEM. During a rotation a fleet holds both keys and artifacts are
+    // signed by one of them, and which one is not something a device needs to
+    // know: `key_version` in the announcement names it for a human reading a
+    // log and is not consulted here.
+    if keys.iter().any(|spki| {
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, spki)
+            .verify(digest, signature)
+            .is_ok()
+    }) {
+        return Ok(());
+    }
+    Err(Error::Ota(format!(
+        "the signature over this artifact's digest is not valid for any of the \
+         {held} firmware signing keys on this device."
+    )))
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -1765,17 +1800,88 @@ mod tests {
     }
 
     #[test]
-    fn a_signing_key_file_holds_exactly_one_key() {
+    fn a_signing_key_file_may_hold_several_and_never_none() {
         let home = tempfile::tempdir().unwrap();
-        let signer = Signer::new();
         let path = home.path().join("artifact-key.pem");
 
-        std::fs::write(&path, format!("{}{}", signer.pem(), Signer::new().pem())).unwrap();
-        let error = public_key(&path).unwrap_err().to_string();
-        assert!(error.contains("exactly one"), "{error}");
+        std::fs::write(&path, Signer::new().pem()).unwrap();
+        assert_eq!(public_keys(&path).unwrap().len(), 1);
 
-        std::fs::write(&path, signer.pem()).unwrap();
-        public_key(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}{}", Signer::new().pem(), Signer::new().pem()),
+        )
+        .unwrap();
+        assert_eq!(public_keys(&path).unwrap().len(), 2);
+
+        // "No keys" and "any key" are one character apart in a config
+        // management system, and only one of them is survivable.
+        std::fs::write(&path, "").unwrap();
+        let error = public_keys(&path).unwrap_err().to_string();
+        assert!(error.contains("no public key"), "{error}");
+
+        std::fs::write(
+            &path,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(public_keys(&path).is_err(), "a certificate is not a key");
+    }
+
+    #[test]
+    fn a_signature_from_any_key_in_the_file_is_accepted() {
+        // ROTATION, WHICH IS THE WHOLE REASON THIS IS A SET. With one key the
+        // only way to install a second is an update signed by the key being
+        // replaced, so a key that is lost or compromised strands the fleet.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("artifact-key.pem");
+        let old = Signer::new();
+        let new = Signer::new();
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b"a build");
+
+        // Step one: only the old key is installed, and it is what signs.
+        std::fs::write(&path, old.pem()).unwrap();
+        verify(
+            &path,
+            digest.as_ref(),
+            &unbase64(&old.sign(digest.as_ref())).unwrap(),
+        )
+        .unwrap();
+        assert!(verify(
+            &path,
+            digest.as_ref(),
+            &unbase64(&new.sign(digest.as_ref())).unwrap()
+        )
+        .is_err());
+
+        // Step two: an artifact signed by the old key added the new one. Both
+        // are trusted, which is what makes the changeover a non-event.
+        std::fs::write(&path, format!("{}{}", old.pem(), new.pem())).unwrap();
+        for signer in [&old, &new] {
+            verify(
+                &path,
+                digest.as_ref(),
+                &unbase64(&signer.sign(digest.as_ref())).unwrap(),
+            )
+            .unwrap();
+        }
+
+        // Step three: the old one is dropped and stops being accepted.
+        std::fs::write(&path, new.pem()).unwrap();
+        verify(
+            &path,
+            digest.as_ref(),
+            &unbase64(&new.sign(digest.as_ref())).unwrap(),
+        )
+        .unwrap();
+        let error = verify(
+            &path,
+            digest.as_ref(),
+            &unbase64(&old.sign(digest.as_ref())).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("any of the 1"), "{error}");
     }
 
     #[test]

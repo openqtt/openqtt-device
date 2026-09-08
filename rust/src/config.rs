@@ -20,7 +20,7 @@ pub const DEFAULT_BROKER: &str = "mqtt.broker-yyz.openqtt.com:8883";
 pub const DEFAULT_ROOT_CA: &str = "/etc/openqtt/root.pem";
 pub const DEFAULT_STATE: &str = "/etc/openqtt/state.json";
 
-/// The public half of the key the platform signs firmware with. Beside the
+/// The public halves of the keys the platform signs firmware with. Beside the
 /// root certificate because it is the same kind of thing: a trust anchor that
 /// arrives out of band and has no fallback.
 pub const DEFAULT_ARTIFACT_KEY: &str = "/etc/openqtt/artifact-key.pem";
@@ -80,11 +80,17 @@ pub struct Config {
     /// Where the certificate, the key and the rotating token live. The
     /// journal that records an update in progress lives beside it.
     pub state: PathBuf,
-    /// The one key firmware signatures are checked against.
+    /// The keys firmware signatures are checked against, one PEM block each.
     ///
-    /// Fail closed like the root certificate: with no key on disk an update is
-    /// refused rather than installed unverified. The CDN is a distribution
-    /// point and never a trust anchor.
+    /// A SET AND NOT ONE KEY, so the signing key can be rotated: ship an
+    /// artifact signed by the old key that adds the new one to this file, let
+    /// the fleet converge, then sign with the new one. With a single key the
+    /// only way to install a replacement is an update signed by the key being
+    /// replaced, so losing it strands the fleet.
+    ///
+    /// Fail closed like the root certificate: with an empty or missing file an
+    /// update is refused rather than installed unverified. The CDN is a
+    /// distribution point and never a trust anchor.
     pub artifact_key: PathBuf,
     /// How long [`crate::Device::connect`] waits for the broker to acknowledge
     /// the connection before giving up. Worth raising on a link where a

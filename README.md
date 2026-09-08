@@ -82,7 +82,7 @@ purpose.
 | `OPENQTT_TOKEN` | | the enrollment token. First run only |
 | `OPENQTT_ROOT_CA` | `/etc/openqtt/root.pem` | the one trusted certificate |
 | `OPENQTT_STATE` | `/etc/openqtt/state.json` | key, certificate and rotating token |
-| `OPENQTT_ARTIFACT_KEY` | `/etc/openqtt/artifact-key.pem` | the one key firmware signatures are checked against |
+| `OPENQTT_ARTIFACT_KEY` | `/etc/openqtt/artifact-key.pem` | the keys firmware signatures are checked against |
 | `OPENQTT_API` | `https://api.openqtt.com` | must be `https`, or a loopback address |
 | `OPENQTT_BROKER` | `mqtt.broker-yyz.openqtt.com:8883` | `host:port`, `mqtts://...` or `wss://host:port/mqtt` |
 | `OPENQTT_CONNECT_TIMEOUT` | `30` | seconds to wait for the first connection |
@@ -209,9 +209,21 @@ message be retained.
 What happens then, in order, because the order is the design.
 
 **The signature is checked before a byte is written.** ECDSA P-256 over the raw
-digest, against the one key in `OPENQTT_ARTIFACT_KEY`. The CDN is a
-distribution point and never a trust anchor, and with no key on disk an update
+digest, against the keys in `OPENQTT_ARTIFACT_KEY`. The CDN is a distribution
+point and never a trust anchor, and with an empty or missing key file an update
 is refused rather than installed.
+
+That file holds a set rather than one key, and the plural is the point. A
+signing key that cannot be replaced is one that never is: with a single key,
+the only way to install a second is an update signed by the key being replaced,
+so a lost or compromised key strands the fleet on the most attractive target in
+the product. With a set, rotation is an ordinary sequence where every step is
+signed by something every device already trusts. Ship an artifact signed by the
+old key whose payload adds the new key to the file, wait for the fleet to
+converge, start signing with the new one, then later ship one that drops the
+old. The device logs how many keys it loaded at startup, because a key somebody
+was sure they installed should be visible as wrong long before an update needs
+it.
 
 **Everything is staged in the running binary's own directory.** Two separate
 incidents in the previous generation: systemd bind-mounts each `ReadWritePaths`

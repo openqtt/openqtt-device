@@ -34,8 +34,10 @@
 //! and `OPENQTT_STATE` to move `/etc/openqtt/state.json` somewhere else.
 //!
 //! Also `OPENQTT_ARTIFACT_KEY` if this device accepts firmware updates: the
-//! public half of the key the platform signs them with, `/etc/openqtt/artifact-key.pem`
-//! by default. With no key on disk an update is refused rather than installed.
+//! public halves of the keys the platform signs them with, one PEM block each,
+//! `/etc/openqtt/artifact-key.pem` by default. A signature that verifies
+//! against any of them is accepted, which is what makes the signing key
+//! rotatable. With no key on disk an update is refused rather than installed.
 //!
 //! # Two things that surprise everybody
 //!
