@@ -37,6 +37,16 @@ webpki-roots = "1"
 
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 
+# THE CRYPTO ALREADY IN THE TREE, NAMED RATHER THAN ADDED. rcgen generates the
+# device key with it and rustls is built on it, so this is the same library
+# reached directly for the two things an update needs: sha256 over an artifact
+# and one ECDSA P-256 verification over that digest. A second stack would mean
+# a second constant-time implementation to trust and, sooner or later, two
+# versions of it in one binary. `cargo tree -i aws-lc-rs` must return one, for
+# the same reason `cargo tree -i rustls` must.
+aws-lc-rs = "1"
+
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }

@@ -135,6 +135,7 @@ async fn fixture(pinned: Arc<Authority>, chain: Arc<Authority>) -> Fixture {
         broker_transport: BrokerTransport::Tls,
         root_ca: root,
         state: home.path().join("openqtt").join("state.json"),
+        artifact_key: home.path().join("artifact-key.pem"),
         connect_timeout: Duration::from_secs(1),
     };
     Fixture {
@@ -295,6 +296,7 @@ async fn a_wrong_token_on_a_first_run_stops_rather_than_retrying_forever() {
         broker_transport: BrokerTransport::Tls,
         root_ca: root,
         state: home.path().join("state.json"),
+        artifact_key: home.path().join("artifact-key.pem"),
         connect_timeout: Duration::from_secs(1),
     };
 
@@ -332,6 +334,7 @@ async fn a_missing_root_says_which_file_and_why() {
         broker_transport: BrokerTransport::Tls,
         root_ca: home.path().join("nowhere").join("root.pem"),
         state: home.path().join("state.json"),
+        artifact_key: home.path().join("artifact-key.pem"),
         connect_timeout: Duration::from_secs(1),
     };
 

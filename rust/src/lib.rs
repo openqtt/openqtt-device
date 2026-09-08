@@ -54,6 +54,7 @@ mod error;
 mod identity;
 mod journal;
 mod mqtt;
+mod ota;
 mod renew;
 mod signals;
 mod state;

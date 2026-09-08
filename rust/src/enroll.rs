@@ -143,7 +143,7 @@ impl Client {
 /// only works on a full distribution is not one. This costs about 250 KB and it
 /// bought the v4 gateway its entire fielded fleet back after a broker
 /// certificate moved to a public issuer.
-fn public_roots() -> ClientConfig {
+pub(crate) fn public_roots() -> ClientConfig {
     let roots = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
