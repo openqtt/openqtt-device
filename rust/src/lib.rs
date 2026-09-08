@@ -48,9 +48,11 @@
 #![warn(missing_docs)]
 
 mod config;
+mod durable;
 mod enroll;
 mod error;
 mod identity;
+mod journal;
 mod mqtt;
 mod renew;
 mod state;
