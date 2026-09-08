@@ -55,6 +55,7 @@ mod identity;
 mod journal;
 mod mqtt;
 mod renew;
+mod signals;
 mod state;
 
 use std::path::PathBuf;
@@ -72,6 +73,7 @@ use tokio::task::JoinHandle;
 
 pub use crate::config::{BrokerTransport, Config};
 pub use crate::error::{Error, Result};
+pub use crate::signals::Signal;
 
 /// How long a handover waits for the replacement connection before giving up
 /// and letting the ordinary retry take over. Long enough for a handshake, short
@@ -226,6 +228,26 @@ impl Device {
         let body = serde_json::to_vec(&payload)
             .map_err(|error| Error::Crypto(format!("could not encode the payload: {error}")))?;
         self.publish_bytes(topic, body, QoS::AtLeastOnce).await
+    }
+
+    /// Say what this device is doing, when that is not a reading.
+    ///
+    /// One of exactly three things: see [`Signal`]. A closed set because a
+    /// console that renders an unknown status is showing a string nobody
+    /// chose.
+    ///
+    /// ```no_run
+    /// # async fn run(device: &openqtt_device::Device) -> Result<(), openqtt_device::Error> {
+    /// use std::time::Duration;
+    /// use openqtt_device::Signal;
+    ///
+    /// device.signal(Signal::Sleeping { wakes_in: Duration::from_secs(3600) }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn signal(&self, signal: Signal) -> Result<()> {
+        let (topic, body) = signal.message(Utc::now());
+        self.publish(&topic, body).await
     }
 
     /// Publish bytes, choosing the quality of service.
