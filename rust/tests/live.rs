@@ -57,6 +57,41 @@
 //! the same device subscribes to `#`            -> denied
 //! no client certificate at all                 -> connection refused
 //!
+//! 2026-09-08, the command channel, against the same digest with the ACL from
+//! `infra` branch `broker/commands-and-storage` and 1883 authenticated. The
+//! state file was seeded from the throwaway CA with a renewal date two days
+//! out, so this ran the real crate and never called the api at all.
+//!
+//! ```text
+//! a retained commands/test was published BEFORE the device started, as
+//! ctl.platform, which is the offline queue this design rests on
+//!
+//! the device connects
+//!   -> ingest/acme/production/pump-3/meta/firmware
+//!        {"sha256":"97ebb0f2...","version":"1.0.0"}
+//!   -> ingest/acme/production/pump-3/temperature 21.5
+//!   -> the retained dispatch arrives on CONNACK and both probes answer
+//!        test/result {"run_id":"0f9b2c1e","test_id":"sd_card","status":"pass",
+//!                     "message":"mounted, 3.1 GB free"}
+//!        test/result {"run_id":"0f9b2c1e","test_id":"gps","status":"fail",
+//!                     "message":"no fix, indoors"}
+//!
+//! the SAME device started again, dispatch still retained because the platform
+//! had not cleared it
+//!   -> journal.json says answered: "0f9b2c1e"
+//!   -> zero test/result messages
+//! ```
+//!
+//! That second run is the one worth keeping. It is the property that makes a
+//! retained queue safe rather than a device that re-runs its diagnostics on
+//! every reconnect for the rest of its life, and it fails silently if it ever
+//! regresses: the symptom is noise, not an error.
+//!
+//! STILL OWED, and it is the platform's ACL rather than this crate: that a
+//! device is refused `#` and refused another device's commands. Both were
+//! measured with mosquitto against the same broker and are recorded in
+//! `infra`, but not from this crate.
+//!
 //! certificate handover, forced by shortening the renewal
 //!   -> five consecutive handovers, one connect each
 //!   -> ten messages delivered across them with no gap in the consumer
@@ -116,11 +151,20 @@ async fn a_device_enrols_connects_and_publishes() {
 
 #[tokio::test]
 #[ignore = "needs a real broker and a real device"]
-async fn a_device_cannot_subscribe() {
-    // The ACL denies every subscribe and the crate offers no way to try, so
-    // this asserts the shape of the product rather than the behaviour of the
-    // broker: there is no `subscribe` on `Device`, and adding one would need
-    // the broker rules to change first.
+async fn a_device_subscribes_to_commands_and_to_nothing_else() {
+    // THIS TEST USED TO ASSERT THE OPPOSITE and the change is the product's,
+    // not this crate's: the ACL now allows `ingest/${username}/commands/#` and
+    // still denies everything else. The device subscribes on its own, on every
+    // CONNACK, so there is nothing to call here; what has to be confirmed by
+    // hand against the real broker is what the ACL does with the two
+    // subscriptions this crate never sends.
+    //
+    //   mosquitto_sub with this device's certificate on `#`            -> denied
+    //   the same on another device's `ingest/<other>/commands/#`       -> denied
+    //
+    // The connection below reaching CONNACK is what says the allowed one was
+    // accepted: a denied subscribe with `deny_action = ignore` is silence, so
+    // the only honest check is on the broker's own log.
     let device = Device::with_config(live()).await.expect("connect");
     device.shutdown().await;
 }

@@ -33,6 +33,12 @@
 //! Also `OPENQTT_API` and `OPENQTT_BROKER` if this is not the hosted platform,
 //! and `OPENQTT_STATE` to move `/etc/openqtt/state.json` somewhere else.
 //!
+//! Also `OPENQTT_ARTIFACT_KEY` if this device accepts firmware updates: the
+//! public halves of the keys the platform signs them with, one PEM block each,
+//! `/etc/openqtt/artifact-key.pem` by default. A signature that verifies
+//! against any of them is accepted, which is what makes the signing key
+//! rotatable. With no key on disk an update is refused rather than installed.
+//!
 //! # Two things that surprise everybody
 //!
 //! **Publish `temperature`, not `ingest/acme/production/pump-3/temperature`.**
@@ -40,20 +46,61 @@
 //! nobody is listening. [`Device::publish`] refuses that rather than let it
 //! happen quietly.
 //!
-//! **A device cannot subscribe.** The broker denies it. This is a one
-//! directional client on purpose: reading the data back out is a job for a
-//! consumer with its own credential, not for the machines in the field.
+//! **A device subscribes to exactly one thing, and it is about itself.** This
+//! used to say a device cannot subscribe at all, and for a while that was
+//! true. It subscribes to `commands/#` now, which the broker mounts under this
+//! device's own prefix, so the platform can tell a device to update itself,
+//! run a diagnostic or renew early. Everything else is unchanged: reading
+//! other devices' data back out is still a job for a consumer with its own
+//! credential, not for the machines in the field.
+//!
+//! # What the platform can ask for
+//!
+//! Three things, all of them retained, so a device that has been switched off
+//! for a week gets them on the next connect.
+//!
+//! - **A firmware version.** Desired state rather than an order: the device
+//!   compares the announced sha256 against the binary it is running. It
+//!   verifies the platform's signature over that digest before writing
+//!   anything, installs beside the running binary, restarts into it, and puts
+//!   the old one back if a gating diagnostic fails. See [`Builder::firmware`].
+//! - **A diagnostic run.** Every probe registered with [`Builder::probe`],
+//!   each on its own blocking thread inside its own timeout, one `test/result`
+//!   each. See [`Probe`].
+//! - **An early certificate renewal**, for a compromised intermediate. Only
+//!   the instruction travels; the device fetches through the enrollment route
+//!   it already uses, so the private key still never leaves it.
+//!
+//! # The unit file, if this device updates itself
+//!
+//! ```ini
+//! [Service]
+//! Restart=always
+//! SuccessExitStatus=73
+//! ```
+//!
+//! An update ends by exiting 73 so the service manager starts the new binary.
+//! `SuccessExitStatus` stops that being logged as a crash and counted against
+//! the restart limiter. `Restart=on-failure` is the trap: it reads the same
+//! declaration, concludes 73 is success, does not restart, and leaves the
+//! service dead after every update.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod commands;
 mod config;
+mod durable;
 mod enroll;
 mod error;
 mod identity;
+mod journal;
 mod mqtt;
+mod ota;
 mod renew;
+mod signals;
 mod state;
+mod tests;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,6 +117,8 @@ use tokio::task::JoinHandle;
 
 pub use crate::config::{BrokerTransport, Config};
 pub use crate::error::{Error, Result};
+pub use crate::signals::Signal;
+pub use crate::tests::{Outcome, Probe};
 
 /// How long a handover waits for the replacement connection before giving up
 /// and letting the ordinary retry take over. Long enough for a handshake, short
@@ -116,7 +165,10 @@ pub struct Device {
     /// paid for it with a certificate-error sniffer and a watchdog that exits
     /// the process, both of which exist only because the closures that publish
     /// had already captured a client.
-    client: Arc<ArcSwap<AsyncClient>>,
+    ///
+    /// [`mqtt::Publisher`] is that cell, and everything this crate spawns in
+    /// the background holds one too rather than a client of its own.
+    publisher: mqtt::Publisher,
     common_name: String,
     /// Notified when a connection has put its DISCONNECT on the wire. Shared
     /// with every polling task, so `shutdown` waits on the same signal a
@@ -139,12 +191,165 @@ impl Device {
     /// by the renewal task, so refusing to return one would remove the only
     /// thing able to fix it.
     pub async fn connect() -> Result<Device> {
-        Device::with_config(Config::from_env()?).await
+        Device::builder().connect().await
     }
 
     /// The same, with configuration from somewhere other than the environment.
     pub async fn with_config(config: Config) -> Result<Device> {
+        Device::builder().config(config).connect().await
+    }
+
+    /// A device with diagnostics, or a firmware version, or both.
+    ///
+    /// EVERYTHING THE PLATFORM CAN ASK FOR HAS TO BE IN PLACE BEFORE THE
+    /// CONNECTION, because every command is retained and can therefore arrive
+    /// on the first CONNACK, ahead of the next line of the program. That is why
+    /// this is a builder and not a pair of methods on a connected device.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), openqtt_device::Error> {
+    /// use openqtt_device::{Device, Outcome, Probe};
+    ///
+    /// let device = Device::builder()
+    ///     .firmware(env!("CARGO_PKG_VERSION"))
+    ///     .probe(Probe::new("sd_card", |message| {
+    ///         message.push_str("mounted, 3.1 GB free");
+    ///         Outcome::Pass
+    ///     }).timeout_secs(20))
+    ///     .connect()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn builder() -> Builder {
+        Builder::default()
+    }
+
+    /// The name in this device's certificate, which is also the prefix every
+    /// message it publishes arrives under.
+    pub fn common_name(&self) -> &str {
+        &self.common_name
+    }
+
+    /// Publish `payload` as JSON, at least once.
+    ///
+    /// The topic is relative: see the note on the module about the mountpoint.
+    pub async fn publish<T: Serialize>(&self, topic: &str, payload: T) -> Result<()> {
+        let body = serde_json::to_vec(&payload)
+            .map_err(|error| Error::Crypto(format!("could not encode the payload: {error}")))?;
+        self.publish_bytes(topic, body, QoS::AtLeastOnce).await
+    }
+
+    /// Say what this device is doing, when that is not a reading.
+    ///
+    /// One of exactly three things: see [`Signal`]. A closed set because a
+    /// console that renders an unknown status is showing a string nobody
+    /// chose.
+    ///
+    /// ```no_run
+    /// # async fn run(device: &openqtt_device::Device) -> Result<(), openqtt_device::Error> {
+    /// use std::time::Duration;
+    /// use openqtt_device::Signal;
+    ///
+    /// device.signal(Signal::Sleeping { wakes_in: Duration::from_secs(3600) }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn signal(&self, signal: Signal) -> Result<()> {
+        let (topic, body) = signal.message(Utc::now());
+        self.publish(&topic, body).await
+    }
+
+    /// Publish bytes, choosing the quality of service.
+    pub async fn publish_bytes(
+        &self,
+        topic: &str,
+        payload: impl Into<Vec<u8>>,
+        qos: QoS,
+    ) -> Result<()> {
+        self.publisher.bytes(topic, payload.into(), qos).await
+    }
+
+    /// Disconnect cleanly and stop renewing.
+    ///
+    /// A clean DISCONNECT suppresses the last will, which is what tells the
+    /// platform this was a planned stop and not a machine that fell over.
+    pub async fn shutdown(self) {
+        // Registered before the disconnect is asked for, or a fast connection
+        // notifies before anything is listening. Waiting for the signal rather
+        // than sleeping is what stops a publish that was still queued from
+        // being aborted along with the task at the end of this function.
+        let flushed = self.flushed.notified();
+        tokio::pin!(flushed);
+        flushed.as_mut().enable();
+
+        self.publisher.disconnect().await;
+        if tokio::time::timeout(DISCONNECT_GRACE, flushed)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                seconds = DISCONNECT_GRACE.as_secs(),
+                "shutting down without confirmation that queued messages were sent"
+            );
+        }
+    }
+}
+
+/// A device under construction. See [`Device::builder`].
+#[derive(Default)]
+pub struct Builder {
+    config: Option<Config>,
+    probes: tests::Registry,
+    firmware: Option<String>,
+}
+
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Builder")
+            .field("firmware", &self.firmware)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Builder {
+    /// Configuration from somewhere other than the environment.
+    pub fn config(mut self, config: Config) -> Builder {
+        self.config = Some(config);
+        self
+    }
+
+    /// Register a diagnostic this firmware can run. See [`Probe`].
+    ///
+    /// Registering the same id twice keeps the later one and says so.
+    pub fn probe(mut self, probe: Probe) -> Builder {
+        self.probes.add(probe);
+        self
+    }
+
+    /// What version this firmware is, which is what turns updates on.
+    ///
+    /// THE ONLY THING THIS CRATE CANNOT WORK OUT FOR ITSELF. It hashes the
+    /// running binary to know WHICH firmware it is, and that is what a rollout
+    /// is judged by, but the version is a name the application chose and
+    /// `env!("CARGO_PKG_VERSION")` is usually it. Without one, `meta/firmware`
+    /// is not published and an announced update is refused with a line in the
+    /// log rather than installed against a version nobody can name.
+    pub fn firmware(mut self, version: impl Into<String>) -> Builder {
+        self.firmware = Some(version.into());
+        self
+    }
+
+    /// Read the environment if it has to, enrol if it has to, connect, and
+    /// start everything that runs in the background.
+    pub async fn connect(self) -> Result<Device> {
+        let config = match self.config {
+            Some(config) => config,
+            None => Config::from_env()?,
+        };
         let store = state::Store::new(&config.state);
+        let journal = journal::Store::beside(&config.state);
         let pin = read_pin(&config.root_ca)?;
         let api = enroll::Client::new(config.enroll_url())?;
 
@@ -154,13 +359,45 @@ impl Device {
             first,
         } = establish(&api, &store, &config).await?;
 
-        let (client, eventloop) = build_client(&current, &pin, &config)?;
-        let (ready, connected) = oneshot::channel();
         let flushed = Arc::new(Notify::new());
-        let pump = Connection::spawn(eventloop, ready, Arc::clone(&flushed));
+        // Absent on a build that did not say what version it is, and absent
+        // rather than fatal when this device cannot find its own binary: a
+        // device that cannot be updated should still publish its readings.
+        let updater = match &self.firmware {
+            None => None,
+            Some(version) => match updater(version, &config, &flushed) {
+                Ok(updater) => Some(updater),
+                Err(error) => {
+                    tracing::error!(%error, "updates are off on this device");
+                    None
+                }
+            },
+        };
+
+        let (client, eventloop) = build_client(&current, &pin, &config)?;
+        let cell = Arc::new(ArcSwap::from_pointee(client.clone()));
+        let publisher = mqtt::Publisher::new(Arc::clone(&cell));
+
+        let (deliveries, incoming) = mpsc::channel(commands::QUEUE);
+        let wiring = Arc::new(mqtt::Wiring {
+            firmware: updater.as_ref().and_then(|updater| {
+                serde_json::to_vec(&updater.running().meta())
+                    .inspect_err(|error| tracing::warn!(%error, "could not encode meta/firmware"))
+                    .ok()
+            }),
+            commands: deliveries,
+        });
+
+        let (ready, connected) = oneshot::channel();
+        let pump = Connection::spawn(
+            client,
+            eventloop,
+            ready,
+            Arc::clone(&flushed),
+            Arc::clone(&wiring),
+        );
 
         let common_name = current.common_name.clone();
-        let cell = Arc::new(ArcSwap::from_pointee(client));
 
         // RENEWAL STARTS BEFORE THE CONNECTION IS WAITED FOR, and the order is
         // a fix rather than a tidy-up. It used to start afterwards, so a device
@@ -169,12 +406,29 @@ impl Device {
         // restart repeated the same minute. The two are independent and the one
         // that heals the other has to run first.
         let (renewed, handovers) = mpsc::channel(1);
+        let (asked, asking) = mpsc::channel(1);
         let renewing = Abort(tokio::spawn(renew::task(
             enroll::Client::new(config.enroll_url())?,
             state::Store::new(&config.state),
             current,
             wait,
             renewed,
+            asking,
+        )));
+
+        // AND SO DOES THE WORKER, for the same shape of reason. The first thing
+        // it does is settle an update that has not been settled yet, and the
+        // firmware most in need of being rolled back is the one that broke the
+        // network.
+        let working = Abort(tokio::spawn(commands::work(
+            commands::Worker {
+                publisher: publisher.clone(),
+                journal,
+                probes: Arc::new(self.probes),
+                firmware: updater,
+                certificate: asked,
+            },
+            incoming,
         )));
 
         let acknowledged = tokio::time::timeout(config.connect_timeout, connected).await;
@@ -195,94 +449,30 @@ impl Device {
         }
 
         let supervising = Abort(tokio::spawn(supervise(
-            Arc::clone(&cell),
-            store,
-            pin,
-            config,
-            pump,
-            handovers,
+            cell, store, pin, config, pump, handovers, wiring,
         )));
 
         Ok(Device {
-            client: cell,
+            publisher,
             common_name,
             flushed,
-            _tasks: vec![renewing, supervising],
+            _tasks: vec![renewing, working, supervising],
         })
     }
+}
 
-    /// The name in this device's certificate, which is also the prefix every
-    /// message it publishes arrives under.
-    pub fn common_name(&self) -> &str {
-        &self.common_name
-    }
-
-    /// Publish `payload` as JSON, at least once.
-    ///
-    /// The topic is relative: see the note on the module about the mountpoint.
-    pub async fn publish<T: Serialize>(&self, topic: &str, payload: T) -> Result<()> {
-        let body = serde_json::to_vec(&payload)
-            .map_err(|error| Error::Crypto(format!("could not encode the payload: {error}")))?;
-        self.publish_bytes(topic, body, QoS::AtLeastOnce).await
-    }
-
-    /// Publish bytes, choosing the quality of service.
-    pub async fn publish_bytes(
-        &self,
-        topic: &str,
-        payload: impl Into<Vec<u8>>,
-        qos: QoS,
-    ) -> Result<()> {
-        mqtt::check_topic(topic)?;
-        let payload = payload.into();
-        // THE LIMIT IS ON THE PACKET AND NOT ON THE PAYLOAD, so the topic and
-        // the header have to be counted too. Comparing the payload alone
-        // accepted a message a few bytes over the line and let the broker or
-        // the client refuse it later, which is the wrong place to find out.
-        // The topic the BROKER sees is longer still: the mountpoint prepends
-        // `ingest/<common name>/` before it is measured against the listener.
-        let packet = mqtt::packet_size(topic, payload.len(), qos);
-        if packet > mqtt::MAX_PACKET {
-            return Err(Error::Topic(format!(
-                "this message is {packet} bytes once the topic and the header are \
-                 counted, and the broker accepts {}. The payload alone is {}.",
-                mqtt::MAX_PACKET,
-                payload.len()
-            )));
-        }
-        // `load` and not a captured clone: this is the cell that makes a
-        // certificate handover invisible to the caller.
-        self.client
-            .load()
-            .publish(topic, qos, false, payload)
-            .await?;
-        Ok(())
-    }
-
-    /// Disconnect cleanly and stop renewing.
-    ///
-    /// A clean DISCONNECT suppresses the last will, which is what tells the
-    /// platform this was a planned stop and not a machine that fell over.
-    pub async fn shutdown(self) {
-        // Registered before the disconnect is asked for, or a fast connection
-        // notifies before anything is listening. Waiting for the signal rather
-        // than sleeping is what stops a publish that was still queued from
-        // being aborted along with the task at the end of this function.
-        let flushed = self.flushed.notified();
-        tokio::pin!(flushed);
-        flushed.as_mut().enable();
-
-        let _ = self.client.load().disconnect().await;
-        if tokio::time::timeout(DISCONNECT_GRACE, flushed)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                seconds = DISCONNECT_GRACE.as_secs(),
-                "shutting down without confirmation that queued messages were sent"
-            );
-        }
-    }
+/// The three things an update needs to know about this device.
+fn updater(version: &str, config: &Config, flushed: &Arc<Notify>) -> Result<ota::Updater> {
+    let paths = ota::Paths::running()?;
+    let running = ota::Firmware::running(version, &paths.binary)?;
+    tracing::info!(version, sha256 = %running.sha256, binary = %paths.binary.display(), "running");
+    ota::Updater::new(
+        paths,
+        running,
+        config.artifact_key.clone(),
+        journal::Store::beside(&config.state),
+        Arc::clone(flushed),
+    )
 }
 
 impl std::fmt::Debug for Device {
@@ -319,17 +509,21 @@ struct Connection {
 
 impl Connection {
     fn spawn(
+        client: AsyncClient,
         eventloop: rumqttc::EventLoop,
         ready: oneshot::Sender<()>,
         flushed: Arc<Notify>,
+        wiring: Arc<mqtt::Wiring>,
     ) -> Connection {
         let retiring = Arc::new(AtomicBool::new(false));
         Connection {
             task: tokio::spawn(mqtt::pump(
+                client,
                 eventloop,
                 Some(ready),
                 Arc::clone(&flushed),
                 Arc::clone(&retiring),
+                wiring,
             )),
             retiring,
             flushed,
@@ -615,6 +809,7 @@ async fn supervise(
     config: Config,
     mut polling: Connection,
     mut handovers: mpsc::Receiver<()>,
+    wiring: Arc<mqtt::Wiring>,
 ) {
     while handovers.recv().await.is_some() {
         // Everything that can fail happens BEFORE the cell is touched, so a
@@ -643,8 +838,18 @@ async fn supervise(
         // older one over the moment this one is accepted. That is survivable
         // and brief; going dark on a certificate the broker will not accept is
         // neither.
+        // THE REPLACEMENT SUBSCRIBES BECAUSE IT CANNOT BE BUILT WITHOUT THE
+        // WIRING THAT MAKES IT. A new client has no subscriptions at all, and a
+        // handover that forgot to resubscribe would leave a device that worked
+        // perfectly until its first renewal and was deaf from then on.
         let (ready, connected) = oneshot::channel();
-        let replacement = Connection::spawn(eventloop, ready, Arc::clone(&polling.flushed));
+        let replacement = Connection::spawn(
+            client.clone(),
+            eventloop,
+            ready,
+            Arc::clone(&polling.flushed),
+            Arc::clone(&wiring),
+        );
 
         if tokio::time::timeout(HANDOFF_TIMEOUT, connected)
             .await

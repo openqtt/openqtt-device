@@ -31,6 +31,22 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// The journal exists and cannot be understood. Not a default either, and
+    /// for a smaller but similar reason: the expensive field in it is the
+    /// probation marker, and reading an unreadable marker as "no marker" is
+    /// the guess `ota::recover` exists not to make.
+    #[error("{path} is not a readable device journal: {reason}. Move it aside; a device forgets one diagnostic run and one rollback by doing so")]
+    Journal {
+        /// The journal file.
+        path: PathBuf,
+        /// Why it could not be understood.
+        reason: String,
+    },
+
+    /// An update could not be applied, or could not be trusted enough to try.
+    #[error("{0}")]
+    Ota(String),
+
     /// The state file exists and cannot be understood. NOT a default: a device
     /// that silently starts over would discard the token it needs and enrol as
     /// nobody. Better to stop and say the file is unreadable.

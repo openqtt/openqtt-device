@@ -19,6 +19,11 @@ pub const DEFAULT_API: &str = "https://api.openqtt.com";
 pub const DEFAULT_BROKER: &str = "mqtt.broker-yyz.openqtt.com:8883";
 pub const DEFAULT_ROOT_CA: &str = "/etc/openqtt/root.pem";
 pub const DEFAULT_STATE: &str = "/etc/openqtt/state.json";
+
+/// The public halves of the keys the platform signs firmware with. Beside the
+/// root certificate because it is the same kind of thing: a trust anchor that
+/// arrives out of band and has no fallback.
+pub const DEFAULT_ARTIFACT_KEY: &str = "/etc/openqtt/artifact-key.pem";
 const DEFAULT_TLS_PORT: u16 = 8883;
 const DEFAULT_WEBSOCKET_PORT: u16 = 8084;
 
@@ -72,8 +77,21 @@ pub struct Config {
     pub broker_transport: BrokerTransport,
     /// The single certificate the broker connection is checked against.
     pub root_ca: PathBuf,
-    /// Where the certificate, the key and the rotating token live.
+    /// Where the certificate, the key and the rotating token live. The
+    /// journal that records an update in progress lives beside it.
     pub state: PathBuf,
+    /// The keys firmware signatures are checked against, one PEM block each.
+    ///
+    /// A SET AND NOT ONE KEY, so the signing key can be rotated: ship an
+    /// artifact signed by the old key that adds the new one to this file, let
+    /// the fleet converge, then sign with the new one. With a single key the
+    /// only way to install a replacement is an update signed by the key being
+    /// replaced, so losing it strands the fleet.
+    ///
+    /// Fail closed like the root certificate: with an empty or missing file an
+    /// update is refused rather than installed unverified. The CDN is a
+    /// distribution point and never a trust anchor.
+    pub artifact_key: PathBuf,
     /// How long [`crate::Device::connect`] waits for the broker to acknowledge
     /// the connection before giving up. Worth raising on a link where a
     /// handshake takes longer than a person would wait, such as satellite.
@@ -97,6 +115,9 @@ impl Config {
                 .into(),
             state: var("OPENQTT_STATE")
                 .unwrap_or_else(|| DEFAULT_STATE.to_string())
+                .into(),
+            artifact_key: var("OPENQTT_ARTIFACT_KEY")
+                .unwrap_or_else(|| DEFAULT_ARTIFACT_KEY.to_string())
                 .into(),
             connect_timeout: match var("OPENQTT_CONNECT_TIMEOUT") {
                 None => DEFAULT_CONNECT_TIMEOUT,
@@ -159,7 +180,7 @@ fn clean_api(raw: &str) -> Result<String> {
 
 /// Whether an authority names this machine. Handles `host`, `host:port` and
 /// `[::1]:port`, and stops at the first `/` so a path cannot smuggle a name in.
-fn is_loopback(authority: &str) -> bool {
+pub(crate) fn is_loopback(authority: &str) -> bool {
     let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
     // USERINFO IS THE TRAP AND IT IS NOT THEORETICAL. In
     // `http://127.0.0.1:80@example.com` the host is example.com; everything

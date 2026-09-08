@@ -37,6 +37,16 @@ webpki-roots = "1"
 
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 
+# THE CRYPTO ALREADY IN THE TREE, NAMED RATHER THAN ADDED. rcgen generates the
+# device key with it and rustls is built on it, so this is the same library
+# reached directly for the two things an update needs: sha256 over an artifact
+# and one ECDSA P-256 verification over that digest. A second stack would mean
+# a second constant-time implementation to trust and, sooner or later, two
+# versions of it in one binary. `cargo tree -i aws-lc-rs` must return one, for
+# the same reason `cargo tree -i rustls` must.
+aws-lc-rs = "1"
+
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
@@ -49,6 +59,13 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+# rumqttc's own channel type, so `AsyncClient::from_senders` can hand a test
+# the requests a publish would have put on the wire. Same version rumqttc
+# resolves to, or the `Sender<Request>` it wants is a different type.
+flume = { version = "0.11", default-features = false, features = ["async"] }
+# The buffer rumqttc's own packet codec reads and writes, so `tests/connection.rs`
+# can answer a CONNECT without reimplementing MQTT framing.
+bytes = "1"
 wiremock = "0.6"
 tempfile = "3"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs", "x509-parser"] }  # x509-parser: the test mock signs the device's real CSR

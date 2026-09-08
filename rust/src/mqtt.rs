@@ -5,15 +5,85 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
 use rumqttc::tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
 };
 use rumqttc::tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use rumqttc::{Event, EventLoop, MqttOptions, Outgoing, Packet, QoS, TlsConfiguration, Transport};
-use tokio::sync::{oneshot, Notify};
+use rumqttc::{
+    AsyncClient, Event, EventLoop, MqttOptions, Outgoing, Packet, QoS, TlsConfiguration, Transport,
+};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::config::BrokerTransport;
 use crate::error::{Error, Result};
+
+/// Everything a device publishes goes through one of these.
+///
+/// A HANDLE ON THE CELL RATHER THAN A CLONE OF THE CLIENT, and that is the
+/// same rule `Device`'s own field comment states, applied to every background
+/// task this crate spawns. A task that captured an `AsyncClient` when it
+/// started keeps publishing through the connection that existed then, which
+/// after the next renewal is a connection the broker has already taken over.
+/// Nothing here captures a client; everything resolves through `load()`.
+#[derive(Clone)]
+pub struct Publisher {
+    client: Arc<ArcSwap<AsyncClient>>,
+}
+
+impl Publisher {
+    pub fn new(client: Arc<ArcSwap<AsyncClient>>) -> Publisher {
+        Publisher { client }
+    }
+
+    /// Publish a JSON body at least once, never retained.
+    ///
+    /// NEVER RETAINED, AND THERE IS NO WAY TO ASK FOR IT. A device is refused
+    /// the retain flag on everything it publishes, so that the retained store
+    /// never becomes control-plane state a device can write to. That invariant
+    /// is worth more than any convenience it costs, so this crate does not own
+    /// a code path that sets the flag at all: one that existed and went unused
+    /// is what somebody wires back up in a year.
+    pub async fn json(&self, topic: &str, body: &serde_json::Value) -> Result<()> {
+        let payload = serde_json::to_vec(body)
+            .map_err(|error| Error::Crypto(format!("could not encode the payload: {error}")))?;
+        self.bytes(topic, payload, QoS::AtLeastOnce).await
+    }
+
+    /// `retain` is always false and is not a parameter: see [`Publisher::json`].
+    pub async fn bytes(&self, topic: &str, payload: Vec<u8>, qos: QoS) -> Result<()> {
+        check_topic(topic)?;
+        // THE LIMIT IS ON THE PACKET AND NOT ON THE PAYLOAD, so the topic and
+        // the header have to be counted too. Comparing the payload alone
+        // accepted a message a few bytes over the line and let the broker or
+        // the client refuse it later, which is the wrong place to find out.
+        // The topic the BROKER sees is longer still: the mountpoint prepends
+        // `ingest/<common name>/` before it is measured against the listener.
+        let packet = packet_size(topic, payload.len(), qos);
+        if packet > MAX_PACKET {
+            return Err(Error::Topic(format!(
+                "this message is {packet} bytes once the topic and the header are \
+                 counted, and the broker accepts {}. The payload alone is {}.",
+                MAX_PACKET,
+                payload.len()
+            )));
+        }
+        // `load` and not a captured clone: this is the cell that makes a
+        // certificate handover invisible to the caller.
+        self.client
+            .load()
+            .publish(topic, qos, false, payload)
+            .await?;
+        Ok(())
+    }
+
+    /// Ask the live connection to close. Used by shutdown and by the restart
+    /// an update ends with.
+    pub async fn disconnect(&self) {
+        let _ = self.client.load().disconnect().await;
+    }
+}
 
 /// The broker's own ceiling (`emqx_schema.erl`, `max_packet_size`). rumqttc
 /// defaults to 10 KB and refuses anything larger CLIENT SIDE, silently, which
@@ -180,9 +250,14 @@ pub fn options(
 
     // A resumed session delivers pubacks for packet ids the new session never
     // sent. rumqttc calls that an "Unsolicited puback packet", errors, and
-    // reconnects, which is a loop rather than an incident. Nothing is lost by
-    // starting clean: the ACL denies every subscribe, so there is no
-    // subscription to restore.
+    // reconnects, which is a loop rather than an incident.
+    //
+    // THE PRICE IS THAT NO SUBSCRIPTION SURVIVES A RECONNECT, and paying it
+    // knowingly is why `connected` exists: every fresh CONNACK subscribes
+    // again. This used to say there was nothing to restore, which was true
+    // while a device could not subscribe at all. A clean session that silently
+    // dropped `commands/#` would leave a device connected, publishing happily,
+    // and deaf.
     options.set_clean_session(true);
     options.set_max_packet_size(MAX_PACKET, MAX_PACKET);
 
@@ -262,6 +337,46 @@ pub fn check_topic(topic: &str) -> Result<()> {
     Ok(())
 }
 
+/// What every fresh connection does before it is any use.
+///
+/// A STRUCT AND NOT A PAIR OF ARGUMENTS, so that a connection cannot be built
+/// without one. There are two places a connection is created, the first one and
+/// the replacement a certificate handover brings up, and the second is the one
+/// that gets forgotten: a device would work perfectly for a day and then stop
+/// receiving commands, silently, which is the worst shape a bug can take.
+pub struct Wiring {
+    /// `meta/firmware`, already encoded. Ground truth, on every connect,
+    /// because the process that would have announced an update's success was
+    /// replaced mid-sentence.
+    pub firmware: Option<Vec<u8>>,
+    /// Where a delivery on `commands/#` goes.
+    pub commands: mpsc::Sender<crate::commands::Delivery>,
+}
+
+/// Subscribe and announce, on every CONNACK.
+///
+/// `try_` AND NOT `await`, AND THAT IS A DEADLOCK AND NOT A STYLE. This runs on
+/// the task that drains rumqttc's request queue, so awaiting a send into that
+/// same queue when it is full waits for a drain that cannot happen until this
+/// returns. The queue is 256 deep and this is the first thing after a CONNACK,
+/// so a refusal here means something is very wrong and says so.
+pub fn connected(client: &AsyncClient, wiring: &Wiring) {
+    if let Err(error) = client.try_subscribe(crate::commands::FILTER, QoS::AtLeastOnce) {
+        tracing::error!(
+            %error,
+            filter = crate::commands::FILTER,
+            "this connection could not subscribe, so it will not be told anything"
+        );
+    }
+    if let Some(firmware) = &wiring.firmware {
+        if let Err(error) =
+            client.try_publish("meta/firmware", QoS::AtLeastOnce, false, firmware.clone())
+        {
+            tracing::warn!(%error, "could not report what firmware this device is running");
+        }
+    }
+}
+
 /// Poll the connection forever, telling `ready` about the first CONNACK.
 ///
 /// rumqttc reconnects on its own as long as something keeps polling, so the
@@ -284,17 +399,40 @@ pub fn check_topic(topic: &str) -> Result<()> {
 /// two different callers wait on it, a handover and a shutdown, and each
 /// connection is only ever asked to disconnect once.
 pub async fn pump(
+    client: AsyncClient,
     mut eventloop: EventLoop,
     mut ready: Option<oneshot::Sender<()>>,
     flushed: Arc<Notify>,
     retiring: Arc<AtomicBool>,
+    wiring: Arc<Wiring>,
 ) {
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 tracing::info!("connected to the broker");
+                // EVERY CONNACK AND NOT ONLY THE FIRST. The session is clean,
+                // so a reconnect starts with no subscriptions at all, and a
+                // handover is a whole new client that never had any.
+                connected(&client, &wiring);
                 if let Some(sender) = ready.take() {
                     let _ = sender.send(());
+                }
+            }
+            Ok(Event::Incoming(Packet::Publish(publish))) => {
+                // OFF THIS TASK IMMEDIATELY. What answers a command downloads
+                // firmware and runs customer code, and doing either here stops
+                // the keepalive: the broker drops a client at keepalive times
+                // 1.5, so a device would go offline while busy doing what it
+                // was told.
+                let delivery = crate::commands::Delivery {
+                    topic: publish.topic,
+                    payload: publish.payload.to_vec(),
+                };
+                if let Err(error) = wiring.commands.try_send(delivery) {
+                    // Every command is retained, so a dropped one comes back on
+                    // the next connect. Saying so is still worth it: a full
+                    // queue means the worker has been busy for a long time.
+                    tracing::warn!(%error, "a command arrived faster than it could be answered");
                 }
             }
             Ok(Event::Outgoing(Outgoing::Disconnect)) => {
@@ -371,6 +509,49 @@ fn private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
                     .to_string(),
             )
         })
+}
+
+/// A `Publisher` whose messages can be read back.
+///
+/// `AsyncClient::from_senders` is rumqttc's own hook for exactly this: the
+/// client puts its requests on a channel the caller holds, so a test can
+/// assert what a device SAID without a socket, an event loop or a broker
+/// anywhere near it.
+#[cfg(test)]
+pub(crate) mod spy {
+    use super::*;
+    use rumqttc::Request;
+
+    pub(crate) fn publisher() -> (Publisher, flume::Receiver<Request>) {
+        let (requests, sent) = flume::bounded(1024);
+        let client = AsyncClient::from_senders(requests);
+        (
+            Publisher::new(Arc::new(ArcSwap::from_pointee(client))),
+            sent,
+        )
+    }
+
+    /// Every publish so far as topic, payload and retain flag. DRAINS: call it
+    /// once per assertion point.
+    pub(crate) fn published(sent: &flume::Receiver<Request>) -> Vec<(String, Vec<u8>, bool)> {
+        sent.try_iter()
+            .filter_map(|request| match request {
+                Request::Publish(publish) => {
+                    Some((publish.topic, publish.payload.to_vec(), publish.retain))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The JSON bodies published to one topic, in order.
+    pub(crate) fn bodies(sent: &flume::Receiver<Request>, topic: &str) -> Vec<serde_json::Value> {
+        published(sent)
+            .into_iter()
+            .filter(|(sent_to, _, _)| sent_to == topic)
+            .map(|(_, payload, _)| serde_json::from_slice(&payload).expect("a JSON body"))
+            .collect()
+    }
 }
 
 #[cfg(test)]
