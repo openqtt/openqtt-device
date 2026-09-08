@@ -101,6 +101,7 @@ mod renew;
 mod signals;
 mod state;
 mod tests;
+mod upload;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,6 +175,9 @@ pub struct Device {
     /// with every polling task, so `shutdown` waits on the same signal a
     /// handover does instead of sleeping and hoping.
     flushed: Arc<Notify>,
+    /// Lines waiting to be uploaded. Shared with the flusher, which is the
+    /// only thing that takes from it.
+    logs: Arc<std::sync::Mutex<upload::Queue>>,
     /// Aborted on drop. The supervisor owns the polling task, so aborting the
     /// supervisor drops that too.
     _tasks: Vec<Abort>,
@@ -238,6 +242,62 @@ impl Device {
         let body = serde_json::to_vec(&payload)
             .map_err(|error| Error::Crypto(format!("could not encode the payload: {error}")))?;
         self.publish_bytes(topic, body, QoS::AtLeastOnce).await
+    }
+
+    /// Queue a log line for upload.
+    ///
+    /// Returns immediately and never fails: a device that cannot log must still
+    /// do its job, and a logging call that can return an error is a logging
+    /// call every caller has to decide what to do about. The batch goes out on
+    /// size or age, whichever comes first, over the same client certificate the
+    /// broker connection uses.
+    ///
+    /// An unknown level is recorded as `info` rather than refused, for the same
+    /// reason: this is the one call in the crate that must not become a
+    /// problem of its own.
+    ///
+    /// ```no_run
+    /// # fn run(device: &openqtt_device::Device) {
+    /// device.log("warn", "the pump drew 14A on start, expected 9A");
+    /// # }
+    /// ```
+    pub fn log(&self, level: &str, message: impl Into<String>) {
+        let level = upload::LEVELS
+            .iter()
+            .find(|known| **known == level)
+            .copied()
+            .unwrap_or("info");
+        // A poisoned lock means the flusher panicked. Dropping the line is the
+        // right answer: the alternative is every subsequent log call panicking
+        // too, which turns a broken uploader into a broken device.
+        if let Ok(mut queue) = self.logs.lock() {
+            queue.push(upload::Line {
+                at: Utc::now(),
+                level,
+                message: message.into(),
+            });
+        }
+    }
+
+    /// How many log lines are waiting, and how many were given up on.
+    ///
+    /// **WORTH REPORTING FROM A PROBE.** v5's best diagnostic is the one that
+    /// passes while saying something is wrong: its SD card test reports how
+    /// many captures are still waiting to upload, because "a backlog that only
+    /// grows is the early warning that captures land but never drain". A log
+    /// backlog says the same thing about the uplink, and a device that never
+    /// looks at its own is a device whose first symptom is a gap in the record
+    /// that nobody can date.
+    ///
+    /// The second number is lines already dropped and not yet reported to the
+    /// platform. It is not a total: it resets when a batch carrying the count
+    /// is accepted.
+    pub fn logs_pending(&self) -> (usize, u64) {
+        match self.logs.lock() {
+            Ok(queue) if queue.is_empty() => (0, queue.dropped()),
+            Ok(queue) => (queue.len(), queue.dropped()),
+            Err(_) => (0, 0),
+        }
     }
 
     /// Say what this device is doing, when that is not a reading.
@@ -448,6 +508,19 @@ impl Builder {
             tracing::warn!(%timeout, "connecting anyway; the connection and the renewal both retry");
         }
 
+        // STARTED BEFORE `supervise` TAKES OWNERSHIP of the store, the pin and
+        // the config. It gets its own store and its own copy of the pin rather
+        // than sharing, because it reads the certificate off disk on every
+        // upload: that is what keeps logs flowing across a renewal instead of
+        // stopping a week after the device was installed.
+        let logs = Arc::new(std::sync::Mutex::new(upload::Queue::new()));
+        let uploading = Abort(tokio::spawn(upload::task(
+            config.logs.clone(),
+            state::Store::new(&config.state),
+            pin.clone(),
+            Arc::clone(&logs),
+        )));
+
         let supervising = Abort(tokio::spawn(supervise(
             cell, store, pin, config, pump, handovers, wiring,
         )));
@@ -456,7 +529,8 @@ impl Builder {
             publisher,
             common_name,
             flushed,
-            _tasks: vec![renewing, working, supervising],
+            logs,
+            _tasks: vec![renewing, working, uploading, supervising],
         })
     }
 }

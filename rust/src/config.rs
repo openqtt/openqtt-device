@@ -92,6 +92,14 @@ pub struct Config {
     /// update is refused rather than installed unverified. The CDN is a
     /// distribution point and never a trust anchor.
     pub artifact_key: PathBuf,
+    /// Where batched log lines are POSTed, authenticated by the same client
+    /// certificate the broker connection uses.
+    ///
+    /// A SEPARATE NAME FROM THE API ON PURPOSE, and the reason is the same one
+    /// that keeps the broker off Cloudflare: a proxy terminating TLS eats the
+    /// client certificate, so the server would see a request and not who sent
+    /// it. This name is DNS only and regional, like the broker's.
+    pub logs: String,
     /// How long [`crate::Device::connect`] waits for the broker to acknowledge
     /// the connection before giving up. Worth raising on a link where a
     /// handshake takes longer than a person would wait, such as satellite.
@@ -119,6 +127,9 @@ impl Config {
             artifact_key: var("OPENQTT_ARTIFACT_KEY")
                 .unwrap_or_else(|| DEFAULT_ARTIFACT_KEY.to_string())
                 .into(),
+            logs: crate::upload::clean_endpoint(
+                &var("OPENQTT_LOGS").unwrap_or_else(|| crate::upload::DEFAULT_LOGS.to_string()),
+            )?,
             connect_timeout: match var("OPENQTT_CONNECT_TIMEOUT") {
                 None => DEFAULT_CONNECT_TIMEOUT,
                 Some(seconds) => Duration::from_secs(seconds.parse().map_err(|_| {

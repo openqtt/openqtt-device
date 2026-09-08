@@ -136,6 +136,9 @@ async fn fixture(pinned: Arc<Authority>, chain: Arc<Authority>) -> Fixture {
         root_ca: root,
         state: home.path().join("openqtt").join("state.json"),
         artifact_key: home.path().join("artifact-key.pem"),
+        // Loopback, so nothing here can reach a real endpoint even if a
+        // flush fires while a test is running.
+        logs: "http://127.0.0.1:1/v1/logs".to_string(),
         connect_timeout: Duration::from_secs(1),
     };
     Fixture {
@@ -297,6 +300,9 @@ async fn a_wrong_token_on_a_first_run_stops_rather_than_retrying_forever() {
         root_ca: root,
         state: home.path().join("state.json"),
         artifact_key: home.path().join("artifact-key.pem"),
+        // Loopback, so nothing here can reach a real endpoint even if a
+        // flush fires while a test is running.
+        logs: "http://127.0.0.1:1/v1/logs".to_string(),
         connect_timeout: Duration::from_secs(1),
     };
 
@@ -335,6 +341,9 @@ async fn a_missing_root_says_which_file_and_why() {
         root_ca: home.path().join("nowhere").join("root.pem"),
         state: home.path().join("state.json"),
         artifact_key: home.path().join("artifact-key.pem"),
+        // Loopback, so nothing here can reach a real endpoint even if a
+        // flush fires while a test is running.
+        logs: "http://127.0.0.1:1/v1/logs".to_string(),
         connect_timeout: Duration::from_secs(1),
     };
 

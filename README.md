@@ -85,6 +85,7 @@ purpose.
 | `OPENQTT_ARTIFACT_KEY` | `/etc/openqtt/artifact-key.pem` | the keys firmware signatures are checked against |
 | `OPENQTT_API` | `https://api.openqtt.com` | must be `https`, or a loopback address |
 | `OPENQTT_BROKER` | `mqtt.broker-yyz.openqtt.com:8883` | `host:port`, `mqtts://...` or `wss://host:port/mqtt` |
+| `OPENQTT_LOGS` | `https://logs.openqtt.com/v1/logs` | where batched log lines go. `https`, or a loopback address |
 | `OPENQTT_CONNECT_TIMEOUT` | `30` | seconds to wait for the first connection |
 
 Nothing is read from a config file, deliberately. A file that fails to parse
@@ -333,6 +334,48 @@ until something rebuilds the TLS client, because the old one captured its
 configuration when it was created. The live client sits behind a lock-free cell
 and every publish resolves through it, so a handover is invisible to the
 caller and nothing has to be restarted.
+
+## Logs
+
+```rust
+device.log("warn", "the pump drew 14A on start, expected 9A");
+```
+
+Queued, batched, and POSTed to `logs.openqtt.com` under the same client
+certificate the broker connection uses. The call returns immediately and cannot
+fail: a device that cannot log still has a job to do, and a logging call that
+returns an error is one every caller has to decide what to do about.
+
+**Not over MQTT, even though the connection is already there.** A batch is
+kilobytes and a reading is bytes. Pushing batches through the broker puts them
+in its memory, through its router and past every consumer subscribed to that
+tenant, to reach a bucket none of that is on the way to.
+
+**Not `api.openqtt.com` either.** That name is behind Cloudflare, and a proxy
+that terminates TLS eats the client certificate: the server would see the
+request and not who sent it. `logs.openqtt.com` is DNS only and regional, the
+same shape and the same reason as the broker endpoint. The server reads the
+organization and namespace out of the common name, so nothing in the body says
+who this is and nothing in the body can lie.
+
+**A batch goes on size or age, whichever comes first.** Size alone means a
+device logging one line an hour holds its first line until it has half a
+megabyte of company, which on a quiet device is never.
+
+**A device that cannot reach the platform for a week must not fill its own
+disk.** There is a byte ceiling and an age cap, and when either bites the oldest
+lines go first: a device coming back after an outage is most useful describing
+what it is doing now. **What it dropped travels with the next batch**, so a gap
+in a log is a number rather than a mystery.
+
+```rust
+let (queued, dropped) = device.logs_pending();
+```
+
+Worth reporting from a probe. The best diagnostic in the previous generation is
+the one that passes while saying something is wrong: its SD card test reports
+how many captures are still waiting to upload, because a backlog that only grows
+is the early warning that things land but never drain.
 
 ## Running the example
 
