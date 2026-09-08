@@ -5,15 +5,95 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
 use rumqttc::tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
 };
 use rumqttc::tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use rumqttc::{Event, EventLoop, MqttOptions, Outgoing, Packet, QoS, TlsConfiguration, Transport};
+use rumqttc::{
+    AsyncClient, Event, EventLoop, MqttOptions, Outgoing, Packet, QoS, TlsConfiguration, Transport,
+};
 use tokio::sync::{oneshot, Notify};
 
 use crate::config::BrokerTransport;
 use crate::error::{Error, Result};
+
+/// Everything a device publishes goes through one of these.
+///
+/// A HANDLE ON THE CELL RATHER THAN A CLONE OF THE CLIENT, and that is the
+/// same rule `Device`'s own field comment states, applied to every background
+/// task this crate spawns. A task that captured an `AsyncClient` when it
+/// started keeps publishing through the connection that existed then, which
+/// after the next renewal is a connection the broker has already taken over.
+/// Nothing here captures a client; everything resolves through `load()`.
+#[derive(Clone)]
+pub struct Publisher {
+    client: Arc<ArcSwap<AsyncClient>>,
+}
+
+impl Publisher {
+    pub fn new(client: Arc<ArcSwap<AsyncClient>>) -> Publisher {
+        Publisher { client }
+    }
+
+    /// Publish a JSON body at least once, never retained.
+    ///
+    /// Not retained because the broker refuses it: see [`Publisher::clear`].
+    pub async fn json(&self, topic: &str, body: &serde_json::Value) -> Result<()> {
+        let payload = serde_json::to_vec(body)
+            .map_err(|error| Error::Crypto(format!("could not encode the payload: {error}")))?;
+        self.bytes(topic, payload, QoS::AtLeastOnce, false).await
+    }
+
+    pub async fn bytes(&self, topic: &str, payload: Vec<u8>, qos: QoS, retain: bool) -> Result<()> {
+        check_topic(topic)?;
+        // THE LIMIT IS ON THE PACKET AND NOT ON THE PAYLOAD, so the topic and
+        // the header have to be counted too. Comparing the payload alone
+        // accepted a message a few bytes over the line and let the broker or
+        // the client refuse it later, which is the wrong place to find out.
+        // The topic the BROKER sees is longer still: the mountpoint prepends
+        // `ingest/<common name>/` before it is measured against the listener.
+        let packet = packet_size(topic, payload.len(), qos);
+        if packet > MAX_PACKET {
+            return Err(Error::Topic(format!(
+                "this message is {packet} bytes once the topic and the header are \
+                 counted, and the broker accepts {}. The payload alone is {}.",
+                MAX_PACKET,
+                payload.len()
+            )));
+        }
+        // `load` and not a captured clone: this is the cell that makes a
+        // certificate handover invisible to the caller.
+        self.client
+            .load()
+            .publish(topic, qos, retain, payload)
+            .await?;
+        Ok(())
+    }
+
+    /// Clear a retained message the PLATFORM published, by publishing zero
+    /// bytes over it.
+    ///
+    /// THE ONE PLACE IN THIS CRATE THAT SETS THE RETAIN FLAG, AND IT MAY WELL
+    /// BE DENIED. A device is refused the retain flag on everything it
+    /// publishes, so that the retained store never becomes control-plane state
+    /// a device can write to, and `deny_action = ignore` means a refusal
+    /// arrives as silence rather than as an error. So this is an optimisation
+    /// and never a correctness requirement: what actually stops a redelivered
+    /// dispatch from running twice is the run id in the journal, written
+    /// before this is attempted. If the clear lands, the redelivery never
+    /// happens; if it does not, the redelivery is a no-op.
+    pub async fn clear(&self, topic: &str) -> Result<()> {
+        self.bytes(topic, Vec::new(), QoS::AtLeastOnce, true).await
+    }
+
+    /// Ask the live connection to close. Used by shutdown and by the restart
+    /// an update ends with.
+    pub async fn disconnect(&self) {
+        let _ = self.client.load().disconnect().await;
+    }
+}
 
 /// The broker's own ceiling (`emqx_schema.erl`, `max_packet_size`). rumqttc
 /// defaults to 10 KB and refuses anything larger CLIENT SIDE, silently, which
@@ -371,6 +451,49 @@ fn private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
                     .to_string(),
             )
         })
+}
+
+/// A `Publisher` whose messages can be read back.
+///
+/// `AsyncClient::from_senders` is rumqttc's own hook for exactly this: the
+/// client puts its requests on a channel the caller holds, so a test can
+/// assert what a device SAID without a socket, an event loop or a broker
+/// anywhere near it.
+#[cfg(test)]
+pub(crate) mod spy {
+    use super::*;
+    use rumqttc::Request;
+
+    pub(crate) fn publisher() -> (Publisher, flume::Receiver<Request>) {
+        let (requests, sent) = flume::bounded(1024);
+        let client = AsyncClient::from_senders(requests);
+        (
+            Publisher::new(Arc::new(ArcSwap::from_pointee(client))),
+            sent,
+        )
+    }
+
+    /// Every publish so far as topic, payload and retain flag. DRAINS: call it
+    /// once per assertion point.
+    pub(crate) fn published(sent: &flume::Receiver<Request>) -> Vec<(String, Vec<u8>, bool)> {
+        sent.try_iter()
+            .filter_map(|request| match request {
+                Request::Publish(publish) => {
+                    Some((publish.topic, publish.payload.to_vec(), publish.retain))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The JSON bodies published to one topic, in order.
+    pub(crate) fn bodies(sent: &flume::Receiver<Request>, topic: &str) -> Vec<serde_json::Value> {
+        published(sent)
+            .into_iter()
+            .filter(|(sent_to, _, _)| sent_to == topic)
+            .map(|(_, payload, _)| serde_json::from_slice(&payload).expect("a JSON body"))
+            .collect()
+    }
 }
 
 #[cfg(test)]

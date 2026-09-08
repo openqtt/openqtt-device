@@ -57,6 +57,7 @@ mod mqtt;
 mod renew;
 mod signals;
 mod state;
+mod tests;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +75,7 @@ use tokio::task::JoinHandle;
 pub use crate::config::{BrokerTransport, Config};
 pub use crate::error::{Error, Result};
 pub use crate::signals::Signal;
+pub use crate::tests::{Outcome, Probe};
 
 /// How long a handover waits for the replacement connection before giving up
 /// and letting the ordinary retry take over. Long enough for a handshake, short
@@ -120,7 +122,10 @@ pub struct Device {
     /// paid for it with a certificate-error sniffer and a watchdog that exits
     /// the process, both of which exist only because the closures that publish
     /// had already captured a client.
-    client: Arc<ArcSwap<AsyncClient>>,
+    ///
+    /// [`mqtt::Publisher`] is that cell, and everything this crate spawns in
+    /// the background holds one too rather than a client of its own.
+    publisher: mqtt::Publisher,
     common_name: String,
     /// Notified when a connection has put its DISCONNECT on the wire. Shared
     /// with every polling task, so `shutdown` waits on the same signal a
@@ -208,7 +213,7 @@ impl Device {
         )));
 
         Ok(Device {
-            client: cell,
+            publisher: mqtt::Publisher::new(cell),
             common_name,
             flushed,
             _tasks: vec![renewing, supervising],
@@ -257,30 +262,9 @@ impl Device {
         payload: impl Into<Vec<u8>>,
         qos: QoS,
     ) -> Result<()> {
-        mqtt::check_topic(topic)?;
-        let payload = payload.into();
-        // THE LIMIT IS ON THE PACKET AND NOT ON THE PAYLOAD, so the topic and
-        // the header have to be counted too. Comparing the payload alone
-        // accepted a message a few bytes over the line and let the broker or
-        // the client refuse it later, which is the wrong place to find out.
-        // The topic the BROKER sees is longer still: the mountpoint prepends
-        // `ingest/<common name>/` before it is measured against the listener.
-        let packet = mqtt::packet_size(topic, payload.len(), qos);
-        if packet > mqtt::MAX_PACKET {
-            return Err(Error::Topic(format!(
-                "this message is {packet} bytes once the topic and the header are \
-                 counted, and the broker accepts {}. The payload alone is {}.",
-                mqtt::MAX_PACKET,
-                payload.len()
-            )));
-        }
-        // `load` and not a captured clone: this is the cell that makes a
-        // certificate handover invisible to the caller.
-        self.client
-            .load()
-            .publish(topic, qos, false, payload)
-            .await?;
-        Ok(())
+        self.publisher
+            .bytes(topic, payload.into(), qos, false)
+            .await
     }
 
     /// Disconnect cleanly and stop renewing.
@@ -296,7 +280,7 @@ impl Device {
         tokio::pin!(flushed);
         flushed.as_mut().enable();
 
-        let _ = self.client.load().disconnect().await;
+        self.publisher.disconnect().await;
         if tokio::time::timeout(DISCONNECT_GRACE, flushed)
             .await
             .is_err()
