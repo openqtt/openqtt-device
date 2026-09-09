@@ -39,8 +39,16 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 
-/// The hosted endpoint. Regional and DNS only, like the broker.
-pub const DEFAULT_LOGS: &str = "https://logs.openqtt.com/v1/logs";
+/// The hosted endpoint, and **the region is in the name for the same reason it
+/// is in the broker's.**
+///
+/// `mqtt.broker-yyz.openqtt.com` is regional because a device is steered to a
+/// region by being told a different name, and the platform plans to do that
+/// through the enrollment response rather than through an update. A logs
+/// endpoint that was not regional would be the one address that could not
+/// move, so a device relocated to another region would keep sending its logs
+/// back across an ocean to the one it left.
+pub const DEFAULT_LOGS: &str = "https://logs.broker-yyz.openqtt.com/v1/logs";
 
 /// How much of one batch may go in a single request.
 ///
