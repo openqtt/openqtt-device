@@ -16,7 +16,7 @@ without a restart.
 
 | | what | for | state |
 | --- | --- | --- | --- |
-| `openqtt-device` | Rust crate | a program under Linux or Windows | **here** |
+| `openqtt-device` | Rust crate | a program under Linux, Windows or macOS | **here** |
 | `libopenqtt-device` | ESP-IDF component | firmware on bare metal | planned, `c/` |
 | `openqtt-consumer` | Python package | reading the data back out | blocked |
 
@@ -54,6 +54,8 @@ deleting it is the right thing to do.
 
 On Windows the files live under `%ProgramData%\OpenQTT` instead, and the
 folder has to be made private before the first run: see [Windows](#windows).
+On macOS they live under `/Library/Application Support/OpenQTT`: see
+[macOS](#macos).
 
 ### The root certificate is not optional
 
@@ -93,6 +95,7 @@ purpose.
 
 On Windows the three paths default to `%ProgramData%\OpenQTT\` rather than
 `/etc/openqtt/`, which is `C:\ProgramData\OpenQTT\` unless somebody moved it.
+On macOS they default to `/Library/Application Support/OpenQTT/`.
 
 Nothing is read from a config file, deliberately. A file that fails to parse
 and a file that is not there are hard to tell apart, and a device that quietly
@@ -273,6 +276,8 @@ after every successful update.
 
 On Windows the service control manager plays this part, and it needs two
 settings of its own and a binary that talks to it: see [Windows](#windows).
+On macOS it is launchd, which needs one key and an ordinary program: see
+[macOS](#macos).
 
 **On the way back up it has to prove itself.** Every gating probe runs. All
 pass and the update is kept. One fails and the old binary goes back, the device
@@ -557,6 +562,177 @@ scanner is reading when an update is kept, is written down in the journal and
 tried again at every start and before the next update, and deleted only if it
 still holds what was recorded. Without that, a `.old` nobody could delete would
 refuse every update after it.
+
+## macOS
+
+Apple silicon and Intel, built for `aarch64-apple-darwin` and
+`x86_64-apple-darwin`, from macOS 11 and 10.12 respectively, the oldest Rust
+builds those two for. CI runs everything on Apple silicon and compiles for
+Intel without running it. The device does the same things and says the same
+things on the wire. What changes is where its files live and what starts it
+again after an update, and launchd starts an ordinary program, so a binary
+needs nothing from this crate to be a daemon.
+
+The builder image makes the Linux and Windows builds only. A macOS build is
+made on a Mac.
+
+### Where things live
+
+```text
+/usr/local/libexec/openqtt/device                       the binary; updates are staged beside it
+/Library/Application Support/OpenQTT/root.pem           OPENQTT_ROOT_CA
+/Library/Application Support/OpenQTT/artifact-key.pem   OPENQTT_ARTIFACT_KEY
+/Library/Application Support/OpenQTT/state.json         OPENQTT_STATE, written by the device
+/Library/Application Support/OpenQTT/journal.json       beside it, written by the device
+/Library/LaunchDaemons/com.openqtt.device.plist         what starts it, and starts it again
+/Library/Logs/OpenQTT/device.log                        what it prints
+```
+
+The folder the three defaults are in is the only change from Linux. The crate
+creates the state file 0600 in a 0700 folder, and tightens a folder that is
+more open than that, as it does there. The binary has a folder of its own
+because an update writes `device.new` and `device.old` beside it, and the
+daemon runs as root, the one account that should be able to write there.
+
+```sh
+sudo install -d -m 700 "/Library/Application Support/OpenQTT"
+sudo install -m 644 root.pem artifact-key.pem "/Library/Application Support/OpenQTT/"
+sudo install -d -m 755 /usr/local/libexec/openqtt /Library/Logs/OpenQTT
+sudo install -m 755 device /usr/local/libexec/openqtt/device
+```
+
+**A binary a browser downloaded will not run.** The browser marks it with
+`com.apple.quarantine`, `install` copies the mark, and macOS kills an ad hoc
+signed binary that carries it as it starts: `Killed: 9`. Clear the mark
+before installing, with `xattr -d com.apple.quarantine device`, or fetch the
+build with `curl`, which does not set it.
+
+### Enrol by hand, then load the daemon
+
+The first run is the one worth watching, so it is made from a Terminal:
+
+```sh
+sudo env OPENQTT_DEVICE=acme/production/pump-3 OPENQTT_TOKEN=oqe_... /usr/local/libexec/openqtt/device
+```
+
+`sudo env` because sudo does not pass the caller's variables through. Stop it
+with Ctrl+C once it says it is connected. The rotated token is in `state.json`
+now, which is why the bootstrap token never has to go into the plist, where
+every user on the machine could read it.
+
+The plist, as `com.openqtt.device.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openqtt.device</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/openqtt/device</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OPENQTT_DEVICE</key>
+        <string>acme/production/pump-3</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/OpenQTT/device.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/OpenQTT/device.log</string>
+</dict>
+</plist>
+```
+
+```sh
+sudo install -m 644 -o root -g wheel com.openqtt.device.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.openqtt.device.plist
+```
+
+It starts at once, because `KeepAlive` implies `RunAtLoad`, and at every boot,
+because the plist is in `/Library/LaunchDaemons`. Four things in there are
+easy to get wrong.
+
+**`KeepAlive` is `true`, not `SuccessfulExit` false.** Nothing tells launchd
+that 73 is a success, so both restart the device after an update. They part
+on an exit 0: `true` restarts after any exit, and `SuccessfulExit` false leaves
+the device stopped after one that returned 0, which is `Restart=on-failure` in
+launchd's words. Measured both ways on macOS 26.
+
+**`ThrottleInterval` is launchd's own default, written down so it is a
+decision.** launchd starts a job at most once every ten seconds, counted from
+its last start. A device that has been up longer than that when an update ends
+it is started again at once, and one that exits sooner waits out the rest of
+the ten seconds. That wait is what keeps a device that cannot start at all
+from asking the enrollment endpoint more than six times a minute, out of a
+limit the whole fleet shares. Lower makes that loop louder; higher delays an
+update or a rollback that comes in the first seconds after a start.
+
+**Nothing secret goes in `EnvironmentVariables`.** The plist is readable by
+every user, and so is what `launchctl print` says about the daemon.
+`OPENQTT_DEVICE` is there because it is not a secret and it pins the state
+file to this device: a state file holding another device's identity is
+refused at startup rather than used. A variable a namespace needs, such as
+`OPENQTT_BROKER` for one on WebSocket, goes beside it. The token never does.
+
+**The plist belongs to root and nobody else can write it**, which is what
+`-o root -g wheel -m 644` is for. launchd refuses to load one that others can
+write.
+
+Both log keys name one file, and what the device prints to either stream lands
+in it in order. launchd creates the file; the folder is made above, so that
+its mode is one somebody chose.
+
+```sh
+launchctl print system/com.openqtt.device                # its state, pid and last exit code
+sudo launchctl kickstart -k system/com.openqtt.device    # stop it and start it again now
+sudo launchctl bootout system/com.openqtt.device         # stop it and unload it
+```
+
+After an update `print` says `last exit code = 73: EX_CANTCREAT`. That is
+launchd naming 73 out of `sysexits.h`, and for this device it means an update
+restarted it, not that a file could not be created. `bootout` lasts until the
+next boot; delete the plist afterwards to remove the daemon for good.
+
+### What an update does differently
+
+Nothing on the wire, nothing in the order, and nothing on disk that Linux does
+not do: the running binary is renamed to `device.old`, the download renamed
+into its place, the device exits 73. A rollback renames `device.old` back over
+the running candidate in one step, as on Linux, so there is never a
+`device.rejected`. The update is written beside the file the binary really is,
+even when the plist names a link to it, which is what Linux does without being
+asked.
+
+What Apple silicon adds is the signature. The kernel starts no arm64 binary
+without a valid one: with it removed, the same build is `Killed: 9` before it
+prints a word. The linker signs every arm64 build ad hoc by itself, which
+`codesign -dv` reports as `flags=0x20002(adhoc,linker-signed)`, and the
+signature is inside the binary, so an update brings its own. The device writes
+the download itself, so there is no quarantine mark on it, and it starts as
+the build it came from would. Both are checked on every test run on a Mac: a
+signed binary sent through the device's own download and renames is started
+from where it landed.
+
+**Never copy a new build over one that has run.** A signed file overwritten in
+place after it has run once is killed at every start after that: measured on
+macOS 26, `cp` over such a binary gives `Killed: 9` from then on. `install` and
+`mv` make a new file and are fine, and so is every update, because an update
+only ever renames.
+
+**Developer ID signing and notarization are future work.** An ad hoc signature
+says the bytes are whole and nothing about who built them, and that is all
+macOS asks of a binary without the quarantine mark. What makes an update
+trustworthy is the platform's own signature over its digest, checked before a
+byte is written. A Developer ID signature would give macOS an identity to
+check as well, and notarization is what would let a build a browser downloaded
+run without the mark being cleared first.
 
 ## Layout
 

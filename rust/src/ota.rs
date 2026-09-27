@@ -30,6 +30,25 @@
 //! that reports a stop with an error instead. The binary also has to be one the
 //! SCM can host at all, which a plain program is not: see `crate::service`.
 //!
+//! # The daemon, on macOS
+//!
+//! ```xml
+//! <key>KeepAlive</key>
+//! <true/>
+//! <key>ThrottleInterval</key>
+//! <integer>10</integer>
+//! ```
+//!
+//! The same exit, and launchd follows it. Nothing tells launchd that 73 is a
+//! success, so it takes it as a failure, and `KeepAlive` true and
+//! `KeepAlive { SuccessfulExit = false }` both restart on it. They part on an
+//! exit 0, which only `true` restarts: `SuccessfulExit` false is
+//! `Restart=on-failure` in launchd's words. A job is started at most once
+//! every `ThrottleInterval` seconds, counted from its last start, so a device
+//! that exits later than that after starting, as an update nearly always
+//! does, is started again at once. launchd starts a plain program, so nothing
+//! in `crate::service` is for it.
+//!
 //! # Where things are written
 //!
 //! IN THE DIRECTORY THE RUNNING BINARY IS IN, and nowhere else. Two separate
@@ -1262,8 +1281,8 @@ async fn farewell(publisher: &Publisher, flushed: &Notify, version: &str) {
 }
 
 /// Hand the process back to the service manager. See this module's header for
-/// the two lines the unit file needs, and the two settings a Windows service
-/// needs.
+/// the two lines the unit file needs, the two settings a Windows service
+/// needs, and the launchd keys that decide what follows the exit on macOS.
 fn restart() -> ! {
     tracing::warn!(
         code = RESTART,
