@@ -71,9 +71,14 @@ use crate::mqtt::Publisher;
 use crate::signals::Signal;
 use crate::tests::Registry;
 
-/// `EX_TEMPFAIL` out of `sysexits.h`, which is as close as that list gets to
-/// "nothing is wrong, start me again". Anything in the 1 to 63 range would be
-/// indistinguishable from the program failing.
+/// The exit that hands the process back to the service manager, so that it
+/// starts the new binary.
+///
+/// 73 IS `EX_CANTCREAT` IN `sysexits.h`. This said it was `EX_TEMPFAIL`,
+/// which is 75, until `launchctl print` on macOS read the code back through
+/// that file as `73: EX_CANTCREAT`. The number stays: the systemd unit in the
+/// README names it, and all it has to be is outside the 1 to 63 range, where
+/// it would read as the program failing.
 const RESTART: i32 = 73;
 
 /// How long a new firmware has to answer its gating tests before it is put
