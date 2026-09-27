@@ -456,6 +456,9 @@ async fn what_this_device_is_running_is_announced_on_every_connect() {
         let body: serde_json::Value = serde_json::from_slice(&meta.1).unwrap();
         assert_eq!(body["version"], "1.4.0");
         assert_eq!(body["sha256"].as_str().unwrap().len(), 64);
+        // Which build to send it next. `build.rs` exports this to every
+        // target in the package, this test included.
+        assert_eq!(body["target"], env!("OPENQTT_TARGET"));
     }
     device.shutdown().await;
 }

@@ -209,6 +209,20 @@ message be retained.
 
 What happens then, in order, because the order is the design.
 
+**A build for another machine is refused before anything is fetched.** A
+namespace can hold devices of several architectures, and a binary built for one
+fails on another with `Exec format error` the first time the service manager
+starts it: after the swap, where the rollback that lives inside the binary never
+gets to run. So each announcement names the target triple its build is for, and
+the device compares that with the triple it was compiled for. On a mismatch it
+reports `built for x86_64-unknown-linux-gnu, this device is
+aarch64-unknown-linux-gnu` as a failed `ota/event` and stops there. The sha is
+not remembered as rejected, because nothing is wrong with the build except where
+it was sent. An announcement with no target, from a platform older than the
+field, is taken as before. The device sends its own triple at every enrollment,
+which is how the platform knows which build to send it, and reports it on
+`meta/firmware` beside the sha it is running.
+
 **The signature is checked before a byte is written.** ECDSA P-256 over the raw
 digest, against the keys in `OPENQTT_ARTIFACT_KEY`. The CDN is a distribution
 point and never a trust anchor, and with an empty or missing key file an update

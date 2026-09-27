@@ -144,6 +144,15 @@ const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
 /// cannot write to its own disk is not going to start working.
 const SAVE_ATTEMPTS: u32 = 5;
 
+/// The target triple this binary was compiled for, as
+/// `aarch64-unknown-linux-gnu`. Exported by `build.rs`.
+///
+/// Sent at every enrollment and on `meta/firmware`, which is how the platform
+/// knows which build to send this device, and checked against every
+/// announcement, which is what stops a build for another machine being
+/// installed when the platform sends one anyway.
+pub(crate) const TARGET: &str = env!("OPENQTT_TARGET");
+
 /// The pinned root, and where it came from, so a mismatch can name the file.
 #[derive(Clone)]
 pub(crate) struct Pin {
