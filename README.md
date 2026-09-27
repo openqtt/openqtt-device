@@ -776,6 +776,24 @@ set OPENQTT_SCM_TEST=1
 cargo test --locked --all-features --test service_manager
 ```
 
+macOS is proven the same way, on `macos-latest`, which is Apple silicon. On a
+Mac, `rust/tests/running_binary.rs` puts real running copies of itself through
+the Unix install and rollback and starts what is at the path after each
+rename, and a unit test sends a signed binary through the device's own
+download and starts it. `rust/tests/launchd.rs` takes the plist out of this
+README and checks it on every run. When asked, it loads that plist as a real
+LaunchDaemon for a copy of itself, and checks that an exit 73, an exit 0 and
+an exit after a long run all start it again, the quick ones no sooner than
+`ThrottleInterval` allows. It asks `sudo -n` for root, so run `sudo -v` first
+where sudo wants a password, or load the plist as an agent of your own user,
+which needs no root and goes through the same keys:
+
+```sh
+cd rust
+OPENQTT_LAUNCHD_TEST=1 cargo test --locked --test launchd
+OPENQTT_LAUNCHD_TEST=user cargo test --locked --test launchd
+```
+
 `rust/tests/connection.rs` opens a loopback socket that speaks enough MQTT to
 answer a CONNECT. **It is not a broker and it is not evidence about one.** It
 enforces no ACL, no mountpoint and no client certificate policy. It exists for

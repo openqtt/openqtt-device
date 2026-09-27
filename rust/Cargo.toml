@@ -100,6 +100,14 @@ required-features = ["windows-service"]
 name = "running_binary"
 harness = false
 
+# The README's plist, checked every time on macOS. And loaded into launchd for
+# a copy of this program, to prove that exit 73 restarts it: opt in with
+# OPENQTT_LAUNCHD_TEST=1 where sudo asks for no password, which CI does, or
+# with OPENQTT_LAUNCHD_TEST=user for an agent of the user running it.
+[[test]]
+name = "launchd"
+harness = false
+
 # `service::run` run by hand, every time. And a real service, registered and
 # started, to prove exit 73 restarts it: opt in with OPENQTT_SCM_TEST=1 from
 # an elevated prompt, which CI does.
