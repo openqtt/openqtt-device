@@ -469,6 +469,22 @@ impl Updater {
             )));
         }
 
+        // NOWHERE TO ROLL BACK TO IS A REASON NOT TO INSTALL. On Windows a
+        // rollback renames the running candidate to `.rejected` before putting
+        // `.old` back, so while something (a scanner, usually) holds the last
+        // parked candidate open, a failed probe of this update could not be
+        // undone and the failing build would keep running. Unix never makes
+        // this file, so there it is never present.
+        if self.paths.rejected.exists() {
+            return Err(Error::Ota(format!(
+                "{} is left from the last rollback and Windows will not let it \
+                 be deleted yet. A rollback of this update would need that name, \
+                 so nothing is installed until it is gone. It is tried again at \
+                 every start and before every update.",
+                self.paths.rejected.display()
+            )));
+        }
+
         // BEFORE A SINGLE BYTE IS WRITTEN. The CDN is a distribution point and
         // never a trust anchor, so nothing it serves is touched until the
         // platform's signature over the digest has been checked against the key
@@ -2631,6 +2647,38 @@ yp3pqun9aUO9CpufgZkRA9Rf9OuZHwqLxAK+KcLrF+kjRm9hCqbAYgyG6w==\n\
             "the new `.old` is the build that was running"
         );
         assert!(bench.journal.load().unwrap().leftovers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_update_waits_while_the_last_rollback_is_still_parked() {
+        // A rollback parked the failed candidate as `.rejected` and a scanner
+        // still holds it. Installing now would leave the next rollback with
+        // nowhere to park, and a failing build running.
+        let mut bench = on_probation_on_windows().await;
+        let (publisher, _sent) = spy::publisher();
+        settle(&mut bench.updater, &publisher, &failing("no reply")).await;
+        bench.restart_into("1.3.0");
+        bench.updater.locked = vec![bench.paths.rejected.clone()];
+        settle(&mut bench.updater, &publisher, &Registry::default()).await;
+        assert!(bench.paths.rejected.exists());
+        let next = bench.serve(b"the build after that", "1.5.0").await;
+
+        let error = bench.updater.install(&publisher, &next).await.unwrap_err();
+        assert!(
+            error.to_string().contains("left from the last rollback"),
+            "{error}"
+        );
+        assert!(!bench.paths.staged.exists(), "nothing was downloaded");
+
+        // Let go, and the same announcement installs with no restart between.
+        bench.updater.locked.clear();
+        assert_eq!(
+            bench.updater.install(&publisher, &next).await.unwrap(),
+            Next::Restart {
+                into: "1.5.0".to_string()
+            }
+        );
+        assert!(!bench.paths.rejected.exists());
     }
 
     #[tokio::test]
