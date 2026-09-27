@@ -285,6 +285,10 @@ pub(crate) struct Updater {
     /// do there.
     #[cfg(test)]
     locked: Vec<PathBuf>,
+    /// Files a test says cannot be read, the way Windows refuses to open one
+    /// another process holds without sharing.
+    #[cfg(test)]
+    unreadable: Vec<PathBuf>,
 }
 
 impl Updater {
@@ -340,6 +344,8 @@ impl Updater {
             platform: Platform::HOST,
             #[cfg(test)]
             locked: Vec::new(),
+            #[cfg(test)]
+            unreadable: Vec::new(),
         })
     }
 
@@ -737,6 +743,16 @@ impl Updater {
 
     /// Delete a file this device has finished with. One that is already gone
     /// is done.
+    /// The sha256 of a file this module might delete. Through here so a test
+    /// can make it unreadable.
+    fn hash(&self, path: &Path) -> Result<String> {
+        #[cfg(test)]
+        if self.unreadable.iter().any(|held| held == path) {
+            return Err(io(path, std::io::ErrorKind::PermissionDenied.into()));
+        }
+        sha256_file(path)
+    }
+
     fn delete(&self, path: &Path) -> Result<()> {
         #[cfg(test)]
         if self.locked.iter().any(|held| held == path) {
@@ -939,12 +955,25 @@ pub(crate) async fn settle(
             // JOURNAL leaves the candidate parked and the marker standing,
             // which reads as this. The marker names the candidate, so the
             // parked file is deleted only if it is that binary.
-            if windows
-                && sha256_file(&updater.paths.rejected)
-                    .is_ok_and(|sha| sha.eq_ignore_ascii_case(&proving.sha256))
-                && updater.delete(&updater.paths.rejected).is_err()
-            {
-                left.push((Spare::Rejected, proving.sha256.clone()));
+            //
+            // ONE THAT CANNOT BE READ YET IS RECORDED, NOT FORGOTTEN. The
+            // marker is cleared above, so without a record nothing would ever
+            // try again, and an install refuses while `.rejected` exists: a
+            // passing lock would block every update for good. `tidy` checks
+            // the recorded sha before it deletes anything.
+            if windows && updater.paths.rejected.exists() {
+                match updater.hash(&updater.paths.rejected) {
+                    Ok(sha) if sha.eq_ignore_ascii_case(&proving.sha256) => {
+                        if updater.delete(&updater.paths.rejected).is_err() {
+                            left.push((Spare::Rejected, proving.sha256.clone()));
+                        }
+                    }
+                    Ok(_) => tracing::warn!(
+                        file = %updater.paths.rejected.display(),
+                        "this is not the candidate that was rolled back, so it is left alone"
+                    ),
+                    Err(_) => left.push((Spare::Rejected, proving.sha256.clone())),
+                }
             }
             if !left.is_empty() {
                 if let Err(error) = updater.journal.update(|journal| {
@@ -2646,6 +2675,44 @@ yp3pqun9aUO9CpufgZkRA9Rf9OuZHwqLxAK+KcLrF+kjRm9hCqbAYgyG6w==\n\
             bench.artifact,
             "the new `.old` is the build that was running"
         );
+        assert!(bench.journal.load().unwrap().leftovers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_rollback_whose_parked_candidate_cannot_be_read_is_kept_for_later() {
+        // A Windows rollback did both renames and was cut off before its
+        // journal write, so the marker still stands and the candidate is
+        // parked. Something holds it without sharing, so it cannot even be
+        // hashed. Forgetting it would leave `.rejected` blocking every update.
+        let mut bench = Bench::new().await;
+        bench.updater.platform = Platform::Windows;
+        let (publisher, _sent) = spy::publisher();
+        let announced = bench.announcement();
+        bench.updater.install(&publisher, &announced).await.unwrap();
+        std::fs::rename(&bench.paths.binary, &bench.paths.rejected).unwrap();
+        std::fs::rename(&bench.paths.previous, &bench.paths.binary).unwrap();
+        bench.updater.unreadable = vec![bench.paths.rejected.clone()];
+
+        assert_eq!(
+            settle(&mut bench.updater, &publisher, &Registry::default()).await,
+            Next::Carry
+        );
+        let held = bench.journal.load().unwrap();
+        assert!(held.probation.is_none());
+        assert_eq!(
+            held.leftovers,
+            [Leftover {
+                file: Spare::Rejected,
+                sha256: announced.sha256.clone()
+            }]
+        );
+        assert!(bench.paths.rejected.exists());
+
+        // Readable again, and the next start checks it is that candidate and
+        // deletes it.
+        bench.updater.unreadable.clear();
+        settle(&mut bench.updater, &publisher, &Registry::default()).await;
+        assert!(!bench.paths.rejected.exists());
         assert!(bench.journal.load().unwrap().leftovers.is_empty());
     }
 
