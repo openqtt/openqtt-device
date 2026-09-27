@@ -63,6 +63,11 @@ pub(crate) fn write_private(path: &Path, body: &[u8]) -> Result<()> {
 /// every save, which for a device means losing the token it had just been
 /// handed. A directory opens at all only with `FILE_FLAG_BACKUP_SEMANTICS`,
 /// and `FlushFileBuffers` refuses a handle that was not opened for writing.
+///
+/// macOS needs nothing different and gets something stronger. std's
+/// `sync_all` there is `fcntl(F_FULLFSYNC)`, which also asks the drive to
+/// empty its own cache, where macOS's `fsync(2)` says it stops at handing the
+/// data to the drive. APFS takes it on a directory as it does on a file.
 fn sync_directory(directory: &Path) -> Result<()> {
     let mut options = fs::OpenOptions::new();
     options.read(true);

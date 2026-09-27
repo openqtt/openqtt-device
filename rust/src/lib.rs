@@ -40,7 +40,8 @@
 //! rotatable. With no key on disk an update is refused rather than installed.
 //!
 //! On Windows the three files default to `%ProgramData%\OpenQTT` instead of
-//! `/etc/openqtt`, and nothing else about them changes.
+//! `/etc/openqtt`, and on macOS to `/Library/Application Support/OpenQTT`.
+//! Nothing else about them changes.
 //!
 //! # Two things that surprise everybody
 //!
