@@ -19,9 +19,14 @@ use crate::error::{Error, Result};
 pub const DEFAULT_API: &str = "https://api.openqtt.com";
 pub const DEFAULT_BROKER: &str = "mqtt.broker-yyz.openqtt.com:8883";
 
-/// Where the files below live when their variables are unset, everywhere but
-/// Windows.
+/// Where the files below live when their variables are unset, on Linux and on
+/// any other Unix but macOS.
 const UNIX_HOME: &str = "/etc/openqtt";
+
+/// The same, on macOS. What a vendor installs for the whole machine lives
+/// under `/Library/Application Support` there, rather than in `/etc`, which is
+/// a link into `/private/etc` and holds the system's own configuration.
+const MACOS_HOME: &str = "/Library/Application Support/OpenQTT";
 
 /// What `%ProgramData%` is when the variable is missing, which it is not on
 /// any Windows that booted normally.
@@ -162,16 +167,22 @@ fn var(key: &str) -> Option<String> {
 }
 
 /// Where a file lives when its variable is unset: `/etc/openqtt` on Linux,
-/// `%ProgramData%\OpenQTT` on Windows.
+/// `/Library/Application Support/OpenQTT` on macOS, `%ProgramData%\OpenQTT`
+/// on Windows.
 ///
 /// PROGRAMDATA IS WINDOWS' `/etc` for this purpose: machine-wide, not any
 /// user's profile, and not beside the binary, which every update replaces.
 /// What it does not share with `/etc/openqtt` is privacy. Every local user can
 /// read what is under it by default and this crate sets no ACL, so the
 /// installation restricts the folder before the first run; see the README.
+///
+/// macOS is a Unix here in everything but the folder: the modes are set and
+/// checked exactly as on Linux.
 fn default_path(file: &str) -> PathBuf {
     if cfg!(windows) {
         windows_path(std::env::var_os("ProgramData"), file)
+    } else if cfg!(target_os = "macos") {
+        Path::new(MACOS_HOME).join(file)
     } else {
         Path::new(UNIX_HOME).join(file)
     }
@@ -478,9 +489,9 @@ mod tests {
         assert!(message.contains("no scheme"), "{message}");
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
-    fn everywhere_but_windows_the_files_are_where_they_always_were() {
+    fn on_linux_the_files_are_where_they_always_were() {
         assert_eq!(
             default_path(ROOT_CA_FILE),
             Path::new("/etc/openqtt/root.pem")
@@ -492,6 +503,25 @@ mod tests {
         assert_eq!(
             default_path(ARTIFACT_KEY_FILE),
             Path::new("/etc/openqtt/artifact-key.pem")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_the_files_live_under_application_support() {
+        // With the space in it, which is why every shell command in the README
+        // that names this folder quotes it.
+        assert_eq!(
+            default_path(ROOT_CA_FILE),
+            Path::new("/Library/Application Support/OpenQTT/root.pem")
+        );
+        assert_eq!(
+            default_path(STATE_FILE),
+            Path::new("/Library/Application Support/OpenQTT/state.json")
+        );
+        assert_eq!(
+            default_path(ARTIFACT_KEY_FILE),
+            Path::new("/Library/Application Support/OpenQTT/artifact-key.pem")
         );
     }
 

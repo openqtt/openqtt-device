@@ -40,7 +40,8 @@
 //! rotatable. With no key on disk an update is refused rather than installed.
 //!
 //! On Windows the three files default to `%ProgramData%\OpenQTT` instead of
-//! `/etc/openqtt`, and nothing else about them changes.
+//! `/etc/openqtt`, and on macOS to `/Library/Application Support/OpenQTT`.
+//! Nothing else about them changes.
 //!
 //! # Two things that surprise everybody
 //!
@@ -101,6 +102,22 @@
 //! that does not talk to it within about thirty seconds, so a device that runs
 //! as a service goes through `service::run`, behind the `windows-service`
 //! feature. The README has the whole installation.
+//!
+//! # The daemon, on macOS
+//!
+//! ```xml
+//! <key>KeepAlive</key>
+//! <true/>
+//! <key>ThrottleInterval</key>
+//! <integer>10</integer>
+//! ```
+//!
+//! launchd starts an ordinary program and has no way to be told that 73 is a
+//! success, so `KeepAlive` true and `SuccessfulExit` false both restart the
+//! device after an update. Only `true` restarts it after an exit 0 as well;
+//! `SuccessfulExit` false leaves it stopped there. The README has the whole
+//! plist, and an arm64 build needs the ad hoc signature its linker already
+//! gives it.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

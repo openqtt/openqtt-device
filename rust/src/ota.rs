@@ -30,6 +30,25 @@
 //! that reports a stop with an error instead. The binary also has to be one the
 //! SCM can host at all, which a plain program is not: see `crate::service`.
 //!
+//! # The daemon, on macOS
+//!
+//! ```xml
+//! <key>KeepAlive</key>
+//! <true/>
+//! <key>ThrottleInterval</key>
+//! <integer>10</integer>
+//! ```
+//!
+//! The same exit, and launchd follows it. Nothing tells launchd that 73 is a
+//! success, so it takes it as a failure, and `KeepAlive` true and
+//! `KeepAlive { SuccessfulExit = false }` both restart on it. They part on an
+//! exit 0, which only `true` restarts: `SuccessfulExit` false is
+//! `Restart=on-failure` in launchd's words. A job is started at most once
+//! every `ThrottleInterval` seconds, counted from its last start, so a device
+//! that exits later than that after starting, as an update nearly always
+//! does, is started again at once. launchd starts a plain program, so nothing
+//! in `crate::service` is for it.
+//!
 //! # Where things are written
 //!
 //! IN THE DIRECTORY THE RUNNING BINARY IS IN, and nowhere else. Two separate
@@ -71,9 +90,14 @@ use crate::mqtt::Publisher;
 use crate::signals::Signal;
 use crate::tests::Registry;
 
-/// `EX_TEMPFAIL` out of `sysexits.h`, which is as close as that list gets to
-/// "nothing is wrong, start me again". Anything in the 1 to 63 range would be
-/// indistinguishable from the program failing.
+/// The exit that hands the process back to the service manager, so that it
+/// starts the new binary.
+///
+/// 73 IS `EX_CANTCREAT` IN `sysexits.h`. This said it was `EX_TEMPFAIL`,
+/// which is 75, until `launchctl print` on macOS read the code back through
+/// that file as `73: EX_CANTCREAT`. The number stays: the systemd unit in the
+/// README names it, and all it has to be is outside the 1 to 63 range, where
+/// it would read as the program failing.
 const RESTART: i32 = 73;
 
 /// How long a new firmware has to answer its gating tests before it is put
@@ -218,6 +242,9 @@ impl Paths {
     /// Windows answers with the path the loader recorded when the process
     /// started, and renaming the file later does not change it. Read once at
     /// startup, as here, that is the path the service manager starts.
+    ///
+    /// macOS answers with the path the process was started by, which a rename
+    /// does not change either, and which can be a link: see `resolved`.
     pub fn running() -> Result<Paths> {
         let binary = std::env::current_exe().map_err(|error| {
             Error::Ota(format!(
@@ -233,8 +260,36 @@ impl Paths {
                 binary.display()
             )));
         }
-        Ok(Paths::beside(binary))
+        Ok(Paths::beside(resolved(binary)?))
     }
+}
+
+/// The file itself, when the path the process was started by is a link to it.
+///
+/// LINUX ALREADY ANSWERS WITH THE FILE, because `/proc/self/exe` is the file,
+/// so an update lands beside the binary however the unit file names it. macOS
+/// answers with the path given to exec, which its man page for
+/// `_NSGetExecutablePath` calls "a path" rather than "a real path". Staged
+/// beside a link, an update would rename the link to `.old`, put the new
+/// binary where the link was, and leave the old binary wherever the link
+/// pointed, for good. Resolved once here, it lands beside the file, as it does
+/// on Linux, and the link goes on naming it.
+#[cfg(target_os = "macos")]
+fn resolved(binary: PathBuf) -> Result<PathBuf> {
+    std::fs::canonicalize(&binary).map_err(|error| {
+        Error::Ota(format!(
+            "this device cannot tell which file {} is, so it cannot replace it: \
+             {error}",
+            binary.display()
+        ))
+    })
+}
+
+/// Everywhere else the path already names the file, or, on Windows, the one
+/// the service control manager starts.
+#[cfg(not(target_os = "macos"))]
+fn resolved(binary: PathBuf) -> Result<PathBuf> {
+    Ok(binary)
 }
 
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
@@ -1226,8 +1281,8 @@ async fn farewell(publisher: &Publisher, flushed: &Notify, version: &str) {
 }
 
 /// Hand the process back to the service manager. See this module's header for
-/// the two lines the unit file needs, and the two settings a Windows service
-/// needs.
+/// the two lines the unit file needs, the two settings a Windows service
+/// needs, and the launchd keys that decide what follows the exit on macOS.
 fn restart() -> ! {
     tracing::warn!(
         code = RESTART,
@@ -2841,5 +2896,90 @@ yp3pqun9aUO9CpufgZkRA9Rf9OuZHwqLxAK+KcLrF+kjRm9hCqbAYgyG6w==\n\
         );
         assert!(!bench.paths.rejected.exists());
         assert!(bench.journal.load().unwrap().leftovers.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_an_update_lands_beside_the_file_a_link_names() {
+        // THE CASE: the plist names a link, `bin/device`, to the binary in
+        // the folder it really lives in. Staged beside the link, the update
+        // would replace the link and strand the old binary for good.
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("libexec").join("device");
+        let link = home.path().join("bin").join("device");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"the firmware that is running").unwrap();
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+
+        let paths = Paths::beside(resolved(link.clone()).unwrap());
+        // Resolved the whole way, as Linux's answer is: the temporary folder
+        // is itself under a link on macOS, `/var` into `/private/var`.
+        let file = std::fs::canonicalize(&file).unwrap();
+        assert_eq!(paths.binary, file);
+        assert_eq!(paths.staged.parent(), file.parent());
+        assert_eq!(paths.previous.parent(), file.parent());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "and the link is left naming it"
+        );
+    }
+
+    /// ARM64 MACOS STARTS NOTHING UNSIGNED, and an update is a binary this
+    /// device wrote itself. Three things make that work, and this checks them
+    /// on a real executable, this test binary, sent through the download and
+    /// the renames an update uses: the linker signs every arm64 build ad hoc,
+    /// the signature is inside the Mach-O and so arrives with the bytes, and a
+    /// file the device wrote itself carries no quarantine mark, which gets an
+    /// ad hoc signed binary killed as it starts.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn on_macos_a_signed_binary_downloaded_and_renamed_into_place_starts() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let this = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let mut bench = Bench::with_artifact(this).await;
+        // The mode an update copies onto the download, as a real binary has.
+        std::fs::set_permissions(&bench.paths.binary, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let (publisher, _sent) = spy::publisher();
+        let announced = bench.announcement();
+        assert_eq!(
+            bench.updater.install(&publisher, &announced).await.unwrap(),
+            Next::Restart {
+                into: "1.4.0".to_string()
+            }
+        );
+
+        let attributes = std::process::Command::new("xattr")
+            .arg(&bench.paths.binary)
+            .output()
+            .unwrap();
+        assert!(attributes.status.success(), "{attributes:?}");
+        let attributes = String::from_utf8_lossy(&attributes.stdout);
+        assert!(!attributes.contains("com.apple.quarantine"), "{attributes}");
+
+        // What the service manager does after the exit: start whatever is at
+        // the path. `--list` makes this test binary name its tests and stop,
+        // which it can only do once the kernel has let it start. A signature
+        // the kernel refused would be SIGKILL, before a line was printed.
+        let started = std::process::Command::new(&bench.paths.binary)
+            .args(["--list", "on_macos_a_signed_binary"])
+            .output()
+            .unwrap();
+        assert!(
+            started.status.success(),
+            "{:?}: {}",
+            started.status,
+            String::from_utf8_lossy(&started.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&started.stdout)
+                .contains("on_macos_a_signed_binary_downloaded_and_renamed_into_place_starts"),
+            "{}",
+            String::from_utf8_lossy(&started.stdout)
+        );
     }
 }

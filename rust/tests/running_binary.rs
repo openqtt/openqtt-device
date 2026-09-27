@@ -1,5 +1,6 @@
 //! What Windows does to a running `.exe`, which an update's swap and rollback
-//! are built on and which nothing but Windows can show.
+//! are built on and which nothing but Windows can show. And on macOS, what the
+//! same renames do there: see the end of this.
 //!
 //! What the update needs, each of them a rename or a delete the crate makes:
 //!
@@ -21,26 +22,95 @@
 //! A program rather than a test function, because it needs a running `.exe`
 //! to try these on, and the simplest one is a copy of itself started with
 //! `--wait`.
+//!
+//! ON MACOS IT CHECKS THE UNIX ORDER, because Apple silicon adds a condition
+//! Linux does not have: the kernel starts no arm64 binary without a valid
+//! signature, and a signed file overwritten in place after it has run is
+//! killed at its next start. The update never writes over a binary; it
+//! renames, so every name the service manager starts is a file that was
+//! whole before it had that name. Here that happens to binaries that are
+//! really running, and what is at the path is started after each rename.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--wait") {
-        // Bounded, so a check that fails half way does not leave a copy
-        // running for long.
-        std::thread::sleep(Duration::from_secs(120));
+    match std::env::args().nth(1).as_deref() {
+        Some("--wait") => {
+            // Bounded, so a check that fails half way does not leave a copy
+            // running for long.
+            std::thread::sleep(Duration::from_secs(120));
+            return;
+        }
+        Some("--hello") => {
+            println!("hello");
+            return;
+        }
+        _ => {}
+    }
+    if cfg!(target_os = "macos") {
+        let home = Scratch::new();
+        install_and_roll_back_on_unix(&home.0);
+        println!("running_binary: ok");
         return;
     }
     if !cfg!(windows) {
-        println!("running_binary: nothing to check off Windows");
+        println!("running_binary: nothing to check off Windows and macOS");
         return;
     }
     let home = Scratch::new();
     install_and_roll_back(&home.0);
     report_what_std_can_do(&home.0);
     println!("running_binary: ok");
+}
+
+/// The install and the rollback in the Unix order, on binaries that are
+/// really running, starting whatever is at the path after each step as the
+/// service manager would.
+fn install_and_roll_back_on_unix(home: &Path) {
+    let binary = home.join("device");
+    let staged = home.join("device.new");
+    let previous = home.join("device.old");
+
+    // An install, with the old firmware running from the binary's path.
+    copy_of_this(&binary);
+    let old = Running::start(&binary);
+    copy_of_this(&staged);
+    std::fs::rename(&binary, &previous).expect("a running binary can be renamed");
+    std::fs::rename(&staged, &binary).expect("and another file renamed into the name it left");
+
+    // Exit 73, and the service manager starts what is at the path now.
+    drop(old);
+    starts(&binary, "the file renamed into place");
+    let candidate = Running::start(&binary);
+
+    // The candidate fails its gate. One rename puts `.old` back over it
+    // while it is still running, which Windows cannot count on and Unix can.
+    std::fs::rename(&previous, &binary)
+        .expect("the last binary that worked is renamed over the running candidate");
+    starts(&binary, "the binary a rollback put back");
+    drop(candidate);
+
+    assert!(binary.exists());
+    for gone in [&staged, &previous] {
+        assert!(!gone.exists(), "{} is still there", gone.display());
+    }
+}
+
+/// Start what is at `path` and check it ran. SIGKILL before a word is what
+/// the kernel does to a binary whose signature it refuses.
+fn starts(path: &Path, what: &str) {
+    let ran = Command::new(path)
+        .arg("--hello")
+        .output()
+        .unwrap_or_else(|error| panic!("{what} could not be started: {error}"));
+    assert!(
+        ran.status.success() && ran.stdout == b"hello\n",
+        "{what} did not run: {:?}, said {:?}",
+        ran.status,
+        String::from_utf8_lossy(&ran.stdout)
+    );
 }
 
 /// The install and the rollback, in the crate's order, on binaries that are

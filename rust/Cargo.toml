@@ -93,10 +93,19 @@ name = "windows_service"
 required-features = ["windows-service"]
 
 # What Windows does to a running `.exe`, which the swap and the rollback are
-# built on. A program rather than a test function, because it runs a copy of
-# itself to have a running `.exe` to try things on.
+# built on, and on macOS what the Unix renames do to a signed binary. A
+# program rather than a test function, because it runs a copy of itself to
+# have a running binary to try things on.
 [[test]]
 name = "running_binary"
+harness = false
+
+# The README's plist, checked every time on macOS. And loaded into launchd for
+# a copy of this program, to prove that exit 73 restarts it: opt in with
+# OPENQTT_LAUNCHD_TEST=1 where sudo asks for no password, which CI does, or
+# with OPENQTT_LAUNCHD_TEST=user for an agent of the user running it.
+[[test]]
+name = "launchd"
 harness = false
 
 # `service::run` run by hand, every time. And a real service, registered and
