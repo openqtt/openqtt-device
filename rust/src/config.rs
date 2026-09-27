@@ -10,20 +10,33 @@
 //! An empty variable is an unset variable. `Environment=OPENQTT_TOKEN=` in a
 //! systemd unit is somebody clearing a value, not setting it to nothing.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
 
 pub const DEFAULT_API: &str = "https://api.openqtt.com";
 pub const DEFAULT_BROKER: &str = "mqtt.broker-yyz.openqtt.com:8883";
-pub const DEFAULT_ROOT_CA: &str = "/etc/openqtt/root.pem";
-pub const DEFAULT_STATE: &str = "/etc/openqtt/state.json";
+
+/// Where the files below live when their variables are unset, everywhere but
+/// Windows.
+const UNIX_HOME: &str = "/etc/openqtt";
+
+/// What `%ProgramData%` is when the variable is missing, which it is not on
+/// any Windows that booted normally.
+const WINDOWS_PROGRAM_DATA: &str = r"C:\ProgramData";
+
+/// The OpenQTT Root CA.
+const ROOT_CA_FILE: &str = "root.pem";
+
+/// The key, the certificate and the rotating token.
+const STATE_FILE: &str = "state.json";
 
 /// The public halves of the keys the platform signs firmware with. Beside the
 /// root certificate because it is the same kind of thing: a trust anchor that
 /// arrives out of band and has no fallback.
-pub const DEFAULT_ARTIFACT_KEY: &str = "/etc/openqtt/artifact-key.pem";
+const ARTIFACT_KEY_FILE: &str = "artifact-key.pem";
 const DEFAULT_TLS_PORT: u16 = 8883;
 const DEFAULT_WEBSOCKET_PORT: u16 = 8084;
 
@@ -119,14 +132,10 @@ impl Config {
             broker_port: broker.port,
             broker_transport: broker.transport,
             root_ca: var("OPENQTT_ROOT_CA")
-                .unwrap_or_else(|| DEFAULT_ROOT_CA.to_string())
-                .into(),
-            state: var("OPENQTT_STATE")
-                .unwrap_or_else(|| DEFAULT_STATE.to_string())
-                .into(),
+                .map_or_else(|| default_path(ROOT_CA_FILE), PathBuf::from),
+            state: var("OPENQTT_STATE").map_or_else(|| default_path(STATE_FILE), PathBuf::from),
             artifact_key: var("OPENQTT_ARTIFACT_KEY")
-                .unwrap_or_else(|| DEFAULT_ARTIFACT_KEY.to_string())
-                .into(),
+                .map_or_else(|| default_path(ARTIFACT_KEY_FILE), PathBuf::from),
             logs: crate::upload::clean_endpoint(
                 &var("OPENQTT_LOGS").unwrap_or_else(|| crate::upload::DEFAULT_LOGS.to_string()),
             )?,
@@ -150,6 +159,39 @@ fn var(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+/// Where a file lives when its variable is unset: `/etc/openqtt` on Linux,
+/// `%ProgramData%\OpenQTT` on Windows.
+///
+/// PROGRAMDATA IS WINDOWS' `/etc` for this purpose: machine-wide, not any
+/// user's profile, and not beside the binary, which every update replaces.
+/// What it does not share with `/etc/openqtt` is privacy. Every local user can
+/// read what is under it by default and this crate sets no ACL, so the
+/// installation restricts the folder before the first run; see the README.
+fn default_path(file: &str) -> PathBuf {
+    if cfg!(windows) {
+        windows_path(std::env::var_os("ProgramData"), file)
+    } else {
+        Path::new(UNIX_HOME).join(file)
+    }
+}
+
+/// `%ProgramData%\OpenQTT\<file>`.
+///
+/// Joined by hand with backslashes rather than by `Path::join`, which uses the
+/// separator of the machine it runs on, so this answers the same thing on
+/// every host and a test on Linux checks what a Windows device will use.
+fn windows_path(program_data: Option<OsString>, file: &str) -> PathBuf {
+    let mut path = program_data
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| OsString::from(WINDOWS_PROGRAM_DATA));
+    if !path.as_encoded_bytes().ends_with(b"\\") {
+        path.push("\\");
+    }
+    path.push("OpenQTT\\");
+    path.push(file);
+    PathBuf::from(path)
 }
 
 /// The enrollment endpoint, refusing a scheme that would put the credential on
@@ -434,5 +476,71 @@ mod tests {
     fn an_api_with_no_scheme_is_refused_rather_than_guessed() {
         let message = clean_api("api.openqtt.com").unwrap_err().to_string();
         assert!(message.contains("no scheme"), "{message}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn everywhere_but_windows_the_files_are_where_they_always_were() {
+        assert_eq!(
+            default_path(ROOT_CA_FILE),
+            Path::new("/etc/openqtt/root.pem")
+        );
+        assert_eq!(
+            default_path(STATE_FILE),
+            Path::new("/etc/openqtt/state.json")
+        );
+        assert_eq!(
+            default_path(ARTIFACT_KEY_FILE),
+            Path::new("/etc/openqtt/artifact-key.pem")
+        );
+    }
+
+    #[test]
+    fn on_windows_the_files_live_under_program_data() {
+        let program_data = || Some(OsString::from(r"C:\ProgramData"));
+        assert_eq!(
+            windows_path(program_data(), ROOT_CA_FILE),
+            PathBuf::from(r"C:\ProgramData\OpenQTT\root.pem")
+        );
+        assert_eq!(
+            windows_path(program_data(), STATE_FILE),
+            PathBuf::from(r"C:\ProgramData\OpenQTT\state.json")
+        );
+        assert_eq!(
+            windows_path(program_data(), ARTIFACT_KEY_FILE),
+            PathBuf::from(r"C:\ProgramData\OpenQTT\artifact-key.pem")
+        );
+    }
+
+    #[test]
+    fn a_program_data_that_was_moved_is_followed() {
+        // An administrator can move it, and the variable is how a program
+        // finds out. A trailing separator is not doubled.
+        for moved in [r"D:\Data", r"D:\Data\"] {
+            assert_eq!(
+                windows_path(Some(moved.into()), STATE_FILE),
+                PathBuf::from(r"D:\Data\OpenQTT\state.json"),
+                "{moved}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_program_data_is_where_windows_puts_it() {
+        for missing in [None, Some(OsString::new())] {
+            assert_eq!(
+                windows_path(missing, STATE_FILE),
+                PathBuf::from(r"C:\ProgramData\OpenQTT\state.json")
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn this_windows_reads_program_data_from_its_own_environment() {
+        let expected = PathBuf::from(std::env::var_os("ProgramData").unwrap())
+            .join("OpenQTT")
+            .join("state.json");
+        assert_eq!(default_path(STATE_FILE), expected);
     }
 }

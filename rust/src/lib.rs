@@ -39,6 +39,9 @@
 //! against any of them is accepted, which is what makes the signing key
 //! rotatable. With no key on disk an update is refused rather than installed.
 //!
+//! On Windows the three files default to `%ProgramData%\OpenQTT` instead of
+//! `/etc/openqtt`, and nothing else about them changes.
+//!
 //! # Two things that surprise everybody
 //!
 //! **Publish `temperature`, not `ingest/acme/production/pump-3/temperature`.**

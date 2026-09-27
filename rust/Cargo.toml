@@ -71,6 +71,13 @@ tempfile = "3"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs", "x509-parser"] }  # x509-parser: the test mock signs the device's real CSR
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# What Windows does to a running `.exe`, which the swap and the rollback are
+# built on. A program rather than a test function, because it runs a copy of
+# itself to have a running `.exe` to try things on.
+[[test]]
+name = "running_binary"
+harness = false
+
 # Only applies when this package is the root, which means the example and
 # anything built out of this repository. A device image is the target: small
 # and stripped beats fast to build.

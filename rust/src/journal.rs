@@ -53,6 +53,56 @@ pub(crate) struct Journal {
     /// no-op rather than a second run.
     #[serde(default)]
     pub answered: Option<String>,
+    /// Binaries beside the running one that this device is finished with and
+    /// could not delete when it was.
+    ///
+    /// WINDOWS FILLS THIS AND NOTHING ELSE DOES. A running `.exe` can always
+    /// be renamed and cannot be counted on to be deleted, so a rollback parks
+    /// the candidate it replaces under a name of its own until a later start,
+    /// when nothing is running it. And a file a virus scanner happens to be
+    /// reading can refuse to go, so a kept update can fail to delete the
+    /// binary it replaced, which would otherwise block every update after it.
+    /// Each is retried at every start and before every update, and deleted
+    /// only while it still holds what is recorded here.
+    ///
+    /// Not written at all while empty, so a journal that has never needed it
+    /// is byte for byte what it was before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leftovers: Vec<Leftover>,
+}
+
+impl Journal {
+    /// Remember a file to delete later.
+    ///
+    /// Replaces whatever was remembered about the same file: something was
+    /// renamed onto it, so the old record no longer describes what it holds.
+    pub fn leave(&mut self, file: Spare, sha256: &str) {
+        self.leftovers.retain(|held| held.file != file);
+        self.leftovers.push(Leftover {
+            file,
+            sha256: sha256.to_string(),
+        });
+    }
+}
+
+/// A file beside the binary, and what it held when it was given up on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Leftover {
+    /// Which one.
+    pub file: Spare,
+    /// Its sha256 when it was recorded. It is deleted only while it still
+    /// holds this, so a binary somebody put there since is never touched.
+    pub sha256: String,
+}
+
+/// The files beside the binary that can be left over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Spare {
+    /// `<binary>.old`, once the update that made it has been kept.
+    Previous,
+    /// `<binary>.rejected`, the candidate a rollback on Windows moved aside.
+    Rejected,
 }
 
 /// An update that is installed but not yet believed.
@@ -210,13 +260,53 @@ mod tests {
     fn what_goes_in_comes_back() {
         let home = tempfile::tempdir().unwrap();
         let store = Store::beside(&home.path().join("state.json"));
-        let written = Journal {
+        let mut written = Journal {
             probation: Some(probation()),
             rejected: Some("cccc".to_string()),
             answered: Some("0f9b2c1e".to_string()),
+            leftovers: Vec::new(),
         };
+        written.leave(Spare::Rejected, "dddd");
         store.save(&written).unwrap();
         assert_eq!(store.load().unwrap(), written);
+    }
+
+    #[test]
+    fn a_journal_with_nothing_left_over_is_written_exactly_as_before() {
+        // A Linux device never records a leftover, and its journal must not
+        // change shape because a Windows one can.
+        let written = Journal {
+            rejected: Some("cccc".to_string()),
+            answered: Some("0f9b2c1e".to_string()),
+            ..Journal::default()
+        };
+        assert_eq!(
+            String::from_utf8(serde_json::to_vec_pretty(&written).unwrap()).unwrap(),
+            "{\n  \"probation\": null,\n  \"rejected\": \"cccc\",\n  \"answered\": \"0f9b2c1e\"\n}"
+        );
+    }
+
+    #[test]
+    fn a_file_left_over_twice_is_remembered_once_with_what_it_holds_now() {
+        // A second rollback renames a second candidate onto `.rejected`, and
+        // the first record no longer describes the file.
+        let mut journal = Journal::default();
+        journal.leave(Spare::Rejected, "aaaa");
+        journal.leave(Spare::Previous, "bbbb");
+        journal.leave(Spare::Rejected, "cccc");
+        assert_eq!(
+            journal.leftovers,
+            [
+                Leftover {
+                    file: Spare::Previous,
+                    sha256: "bbbb".to_string()
+                },
+                Leftover {
+                    file: Spare::Rejected,
+                    sha256: "cccc".to_string()
+                },
+            ]
+        );
     }
 
     #[test]

@@ -34,6 +34,11 @@
 //! between them recoverable. Rename the running binary aside, rename the new
 //! one into place, say goodbye, exit 73. Come back up, run every gating test,
 //! and either keep it or put the old one back.
+//!
+//! The same order on Windows, where a running `.exe` can always be renamed and
+//! cannot be counted on to be replaced or deleted. Installing only ever renames
+//! the running binary, so it is unchanged. Putting the old one back is where
+//! the two differ: see `Updater::restore`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,7 +51,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Notify;
 
 use crate::error::{io, Error, Result};
-use crate::journal::{self, Journal, Probation};
+use crate::journal::{self, Journal, Leftover, Probation, Spare};
 use crate::mqtt::Publisher;
 use crate::signals::Signal;
 use crate::tests::Registry;
@@ -152,7 +157,7 @@ impl Firmware {
     }
 }
 
-/// The three files an update touches, all in one directory.
+/// The files an update touches, all in one directory.
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
     /// The binary this process was launched from.
@@ -162,6 +167,11 @@ pub(crate) struct Paths {
     pub staged: PathBuf,
     /// The last binary known to work. Never overwritten.
     pub previous: PathBuf,
+    /// Where a rollback on Windows parks the candidate it is replacing, which
+    /// is still running: it can be renamed, and deleting it is not something
+    /// to count on. Deleted on a later start. Unix never makes it: there the
+    /// rollback's one rename replaces the candidate outright.
+    pub rejected: PathBuf,
 }
 
 impl Paths {
@@ -169,7 +179,16 @@ impl Paths {
         Paths {
             staged: suffixed(&binary, ".new"),
             previous: suffixed(&binary, ".old"),
+            rejected: suffixed(&binary, ".rejected"),
             binary,
+        }
+    }
+
+    /// The file a leftover names.
+    fn spare(&self, file: Spare) -> &Path {
+        match file {
+            Spare::Previous => &self.previous,
+            Spare::Rejected => &self.rejected,
         }
     }
 
@@ -180,6 +199,10 @@ impl Paths {
     /// which is exactly what a half-finished update leaves behind, and writing
     /// a file with that name would put an update somewhere nothing will ever
     /// execute it from.
+    ///
+    /// Windows answers with the path the loader recorded when the process
+    /// started, and renaming the file later does not change it. Read once at
+    /// startup, as here, that is the path the service manager starts.
     pub fn running() -> Result<Paths> {
         let binary = std::env::current_exe().map_err(|error| {
             Error::Ota(format!(
@@ -205,6 +228,27 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// What the operating system lets a running program's own file do, which is
+/// the one thing about installing an update that differs between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Platform {
+    /// A rename replaces the name of a running binary, and the process keeps
+    /// running from the file it already opened.
+    Unix,
+    /// A running `.exe` can always be renamed, and cannot be counted on to be
+    /// replaced or deleted until the process has gone.
+    Windows,
+}
+
+impl Platform {
+    /// The one this was compiled for.
+    pub const HOST: Platform = if cfg!(windows) {
+        Platform::Windows
+    } else {
+        Platform::Unix
+    };
+}
+
 /// Everything an update needs, held for the life of the process.
 pub(crate) struct Updater {
     paths: Paths,
@@ -218,6 +262,14 @@ pub(crate) struct Updater {
     /// announcement is retained, so without this every reconnect republishes
     /// the same refusal for the rest of the device's life.
     refused: Option<String>,
+    /// How a running binary is put back. The host's, except in a test that
+    /// runs the Windows sequence on another machine.
+    platform: Platform,
+    /// Files a test says cannot be deleted, the way Windows holds a running
+    /// `.exe` or one a virus scanner is reading. Renames still work, as they
+    /// do there.
+    #[cfg(test)]
+    locked: Vec<PathBuf>,
 }
 
 impl Updater {
@@ -270,6 +322,9 @@ impl Updater {
             http,
             flushed,
             refused: None,
+            platform: Platform::HOST,
+            #[cfg(test)]
+            locked: Vec::new(),
         })
     }
 
@@ -368,10 +423,28 @@ impl Updater {
             )));
         }
 
+        // WHAT WINDOWS WOULD NOT LET GO OF IS TRIED AGAIN HERE, not only at
+        // startup. A device can run for months without a restart, and a
+        // `.old` left over by the last update would refuse every update after
+        // it for all of them. Empty everywhere else, and then nothing is read.
+        let left = if held.leftovers.is_empty() {
+            Vec::new()
+        } else {
+            self.tidy(&held)
+        };
+
         // REFUSE TO CLOBBER `.old`. If the last update's health check hung,
         // that file is the last binary known to work, and overwriting it makes
         // the rollback target the previous bad one instead.
         if self.paths.previous.exists() {
+            if left.iter().any(|leftover| leftover.file == Spare::Previous) {
+                return Err(Error::Ota(format!(
+                    "{} is left from the last update and Windows will not let it \
+                     be deleted yet. It is tried again at every start and before \
+                     every update, and nothing is installed until it is gone.",
+                    self.paths.previous.display()
+                )));
+            }
             return Err(Error::Ota(format!(
                 "{} is already there and is the last binary known to work. \
                  Overwriting it would make the next rollback land on a build \
@@ -421,6 +494,11 @@ impl Updater {
                 previous.clone(),
                 PROBATION_WINDOW,
             ));
+            // The `.old` about to be made is the rollback target, and no
+            // record of an earlier one may ever be taken to describe it.
+            journal
+                .leftovers
+                .retain(|leftover| leftover.file != Spare::Previous);
         })?;
 
         if let Err(error) = self.swap() {
@@ -581,6 +659,105 @@ impl Updater {
         }
         Ok(())
     }
+
+    /// Put the last binary that worked back where the running one is, and
+    /// answer whether the running one had to be parked to do it.
+    ///
+    /// ONE RENAME ON UNIX AND TWO ON WINDOWS, and the difference is what each
+    /// lets a running program's file do. Unix replaces the name and the
+    /// process keeps running from the file it opened. Windows has always let
+    /// a running `.exe` be renamed, and `MoveFileEx` and `DeleteFile` refuse
+    /// to replace or delete one. std retries both with POSIX semantics, which
+    /// only some Windows versions and filesystems support at all, and a
+    /// rollback resting on that would work on some devices and not on others.
+    /// So the candidate moves to `.rejected` first, and a later start deletes
+    /// it once nothing is running it.
+    ///
+    /// BETWEEN WINDOWS' TWO RENAMES THERE IS NO BINARY AT THE PATH, the same
+    /// gap an install's two renames have, and the same answer: a failure of
+    /// the second is undone here, while this process is alive to do it.
+    fn restore(&self) -> std::io::Result<bool> {
+        match self.platform {
+            Platform::Unix => {
+                std::fs::rename(&self.paths.previous, &self.paths.binary)?;
+                Ok(false)
+            }
+            Platform::Windows => {
+                std::fs::rename(&self.paths.binary, &self.paths.rejected)?;
+                if let Err(error) = std::fs::rename(&self.paths.previous, &self.paths.binary) {
+                    if let Err(second) = std::fs::rename(&self.paths.rejected, &self.paths.binary) {
+                        return Err(std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "{error}, and the candidate could not be moved back \
+                                 from {} either ({second}). {} holds the last binary \
+                                 that worked",
+                                self.paths.rejected.display(),
+                                self.paths.previous.display()
+                            ),
+                        ));
+                    }
+                    return Err(error);
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Delete a file this device has finished with. One that is already gone
+    /// is done.
+    fn delete(&self, path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if self.locked.iter().any(|held| held == path) {
+            return Err(io(path, std::io::ErrorKind::PermissionDenied.into()));
+        }
+        remove_if_present(path)
+    }
+
+    /// Delete what was left over, if it still holds what was recorded, and
+    /// answer what is still left.
+    ///
+    /// A FILE THAT HOLDS SOMETHING ELSE NOW IS LEFT ALONE AND FORGOTTEN.
+    /// Somebody put it there since, and deleting it would be a guess. One that
+    /// cannot be read or deleted yet stays on the list for the next try.
+    fn tidy(&self, held: &Journal) -> Vec<Leftover> {
+        let mut kept = Vec::new();
+        for leftover in &held.leftovers {
+            let file = self.paths.spare(leftover.file);
+            match sha256_file(file) {
+                Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(%error, "a binary left over from an update could not be read; trying again later");
+                    kept.push(leftover.clone());
+                }
+                Ok(sha) if !sha.eq_ignore_ascii_case(&leftover.sha256) => {
+                    tracing::warn!(
+                        file = %file.display(),
+                        "this is not the binary that was left here, so it is left alone"
+                    );
+                }
+                Ok(_) => match self.delete(file) {
+                    Ok(()) => tracing::info!(
+                        file = %file.display(),
+                        "removed a binary left over from an update"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%error, "a binary left over from an update still cannot be deleted; trying again later");
+                        kept.push(leftover.clone());
+                    }
+                },
+            }
+        }
+        if kept != held.leftovers {
+            if let Err(error) = self
+                .journal
+                .update(|journal| journal.leftovers = kept.clone())
+            {
+                tracing::error!(%error, "could not record which leftover binaries remain");
+            }
+        }
+        kept
+    }
 }
 
 /// Whether the binary on disk is still the one this process is running.
@@ -663,6 +840,11 @@ pub(crate) async fn settle(
 
     match standing(&held, &updater.running.sha256) {
         Standing::Settled => {
+            // Before the check below, which would otherwise report a `.old`
+            // this device knows all about and only could not delete yet.
+            if !held.leftovers.is_empty() {
+                updater.tidy(&held);
+            }
             if updater.paths.previous.exists() {
                 // No marker, so nothing here knows what that file is. It is
                 // refused as a rollback target and it blocks the next update
@@ -704,18 +886,42 @@ pub(crate) async fn settle(
                 tracing::error!(%error, "could not record that this update never booted");
             }
             let _ = remove_if_present(&updater.paths.staged);
+            let windows = updater.platform == Platform::Windows;
+            let mut left = Vec::new();
             // `.old` is a copy of what is running, under a name that would
             // block the next update.
             if updater.paths.previous.exists() {
                 let same = sha256_file(&updater.paths.previous)
                     .is_ok_and(|sha| sha.eq_ignore_ascii_case(&updater.running.sha256));
                 if same {
-                    let _ = remove_if_present(&updater.paths.previous);
+                    if updater.delete(&updater.paths.previous).is_err() && windows {
+                        left.push((Spare::Previous, updater.running.sha256.clone()));
+                    }
                 } else {
                     tracing::warn!(
                         file = %updater.paths.previous.display(),
                         "this is not the binary that booted, so it is left alone"
                     );
+                }
+            }
+            // A WINDOWS ROLLBACK INTERRUPTED BETWEEN ITS RENAMES AND ITS
+            // JOURNAL leaves the candidate parked and the marker standing,
+            // which reads as this. The marker names the candidate, so the
+            // parked file is deleted only if it is that binary.
+            if windows
+                && sha256_file(&updater.paths.rejected)
+                    .is_ok_and(|sha| sha.eq_ignore_ascii_case(&proving.sha256))
+                && updater.delete(&updater.paths.rejected).is_err()
+            {
+                left.push((Spare::Rejected, proving.sha256.clone()));
+            }
+            if !left.is_empty() {
+                if let Err(error) = updater.journal.update(|journal| {
+                    for (file, sha256) in &left {
+                        journal.leave(*file, sha256);
+                    }
+                }) {
+                    tracing::error!(%error, "could not record the binaries left to delete");
                 }
             }
             event(publisher, &proving.version, &proving.sha256, "failed", &why).await;
@@ -792,11 +998,26 @@ async fn prove(
 
 /// Keep it.
 async fn commit(updater: &mut Updater, publisher: &Publisher, proving: &Probation) {
-    if let Err(error) = remove_if_present(&updater.paths.previous) {
-        // Not fatal, but it blocks the next update, so it has to be loud.
-        tracing::error!(%error, "could not remove the binary this update replaced");
+    let mut left = false;
+    if let Err(error) = updater.delete(&updater.paths.previous) {
+        if updater.platform == Platform::Windows {
+            // WINDOWS DOES NOT DELETE A FILE SOMETHING STILL HAS OPEN, and a
+            // virus scanner reading the binary the last process ran from is
+            // enough. Recorded, so the next start or the next update deletes
+            // it rather than refusing to install anything until a person does.
+            tracing::warn!(%error, "could not remove the binary this update replaced yet; it is recorded and tried again");
+            left = true;
+        } else {
+            // Not fatal, but it blocks the next update, so it has to be loud.
+            tracing::error!(%error, "could not remove the binary this update replaced");
+        }
     }
-    if let Err(error) = updater.journal.update(|journal| journal.probation = None) {
+    if let Err(error) = updater.journal.update(|journal| {
+        journal.probation = None;
+        if left {
+            journal.leave(Spare::Previous, &proving.previous_sha256);
+        }
+    }) {
         tracing::error!(%error, "could not clear the probation marker");
     }
     tracing::info!(version = %proving.version, "update kept");
@@ -862,18 +1083,21 @@ async fn revert(
     };
     let _ = held;
 
-    if let Err(error) = std::fs::rename(&updater.paths.previous, &updater.paths.binary) {
-        tracing::error!(%error, "the previous binary could not be moved back into place");
-        event(
-            publisher,
-            &proving.version,
-            &proving.sha256,
-            "failed",
-            &format!("{why}. The rollback itself failed: {error}"),
-        )
-        .await;
-        return Next::Carry;
-    }
+    let parked = match updater.restore() {
+        Ok(parked) => parked,
+        Err(error) => {
+            tracing::error!(%error, "the previous binary could not be moved back into place");
+            event(
+                publisher,
+                &proving.version,
+                &proving.sha256,
+                "failed",
+                &format!("{why}. The rollback itself failed: {error}"),
+            )
+            .await;
+            return Next::Carry;
+        }
+    };
 
     // THE RENAME FIRST AND THE JOURNAL SECOND. A crash between them leaves a
     // marker for a candidate that is no longer installed running beside the
@@ -883,6 +1107,11 @@ async fn revert(
     if let Err(error) = updater.journal.update(|journal| {
         journal.probation = None;
         journal.rejected = Some(proving.sha256.clone());
+        // Parked on Windows, and still running: this process is it. The
+        // start after this one deletes it.
+        if parked {
+            journal.leave(Spare::Rejected, &proving.sha256);
+        }
     }) {
         tracing::error!(%error, "rolled back but could not record it; this build may be installed again");
     }
@@ -1301,6 +1530,31 @@ mod tests {
                 key_version: Some("projects/openqtt-prod/.../cryptoKeyVersions/1".to_string()),
                 target: None,
             }
+        }
+
+        /// Another build, served at a path of its own, and its announcement.
+        async fn serve(&self, artifact: &[u8], version: &str) -> Announcement {
+            let route = format!("/artifact-{version}");
+            Mock::given(method("GET"))
+                .and(path(route.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(artifact.to_vec()))
+                .mount(&self.server)
+                .await;
+            let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, artifact);
+            Announcement {
+                version: version.to_string(),
+                sha256: hex(digest.as_ref()),
+                url: format!("{}{route}", self.server.uri()),
+                signature: self.signer.sign(digest.as_ref()),
+                key_version: None,
+                target: None,
+            }
+        }
+
+        /// The restart, as far as a test can have one: this process is now
+        /// whatever is at the binary's path.
+        fn restart_into(&mut self, version: &str) {
+            self.updater.running = Firmware::running(version, &self.paths.binary).unwrap();
         }
     }
 
@@ -2162,5 +2416,299 @@ yp3pqun9aUO9CpufgZkRA9Rf9OuZHwqLxAK+KcLrF+kjRm9hCqbAYgyG6w==\n\
         let paths = Paths::beside(PathBuf::from("/opt/acme/pump"));
         assert_eq!(paths.staged, PathBuf::from("/opt/acme/pump.new"));
         assert_eq!(paths.previous, PathBuf::from("/opt/acme/pump.old"));
+        assert_eq!(paths.rejected, PathBuf::from("/opt/acme/pump.rejected"));
+    }
+
+    #[test]
+    fn a_windows_binary_keeps_its_extension_inside_every_name() {
+        // `device.exe.old` and not `device.old`: the suffix goes on the whole
+        // name, so the three can never collide with another program's files.
+        let paths = Paths::beside(PathBuf::from(r"C:\Program Files\OpenQTT\device.exe"));
+        assert_eq!(
+            paths.staged,
+            PathBuf::from(r"C:\Program Files\OpenQTT\device.exe.new")
+        );
+        assert_eq!(
+            paths.previous,
+            PathBuf::from(r"C:\Program Files\OpenQTT\device.exe.old")
+        );
+        assert_eq!(
+            paths.rejected,
+            PathBuf::from(r"C:\Program Files\OpenQTT\device.exe.rejected")
+        );
+    }
+
+    /// A gating probe that fails with the sentence a person would read.
+    fn failing(message: &'static str) -> Registry {
+        let mut probes = Registry::default();
+        probes.add(Probe::new("modbus_link", move |said| {
+            said.push_str(message);
+            Outcome::Fail
+        }));
+        probes
+    }
+
+    /// A gating probe that passes.
+    fn passing() -> Registry {
+        let mut probes = Registry::default();
+        probes.add(Probe::new("sd_card", |said| {
+            said.push_str("mounted");
+            Outcome::Pass
+        }));
+        probes
+    }
+
+    /// Where an update has just been installed, on Windows, whatever machine
+    /// runs the test. What Windows itself does to a running `.exe` is proven
+    /// on Windows by `tests/running_binary.rs`; these are the decisions made
+    /// around it.
+    async fn on_probation_on_windows() -> Bench {
+        let mut bench = on_probation().await;
+        bench.updater.platform = Platform::Windows;
+        bench
+    }
+
+    #[tokio::test]
+    async fn on_windows_a_rollback_parks_the_candidate_rather_than_replacing_it() {
+        let mut bench = on_probation_on_windows().await;
+        let candidate = bench.updater.running.sha256.clone();
+        let (publisher, sent) = spy::publisher();
+
+        let next = settle(
+            &mut bench.updater,
+            &publisher,
+            &failing("no reply from the meter"),
+        )
+        .await;
+        assert_eq!(
+            next,
+            Next::Restart {
+                into: "1.3.0".to_string()
+            }
+        );
+        assert_eq!(
+            std::fs::read(&bench.paths.binary).unwrap(),
+            b"the firmware that is running"
+        );
+        assert!(!bench.paths.previous.exists());
+        // Renamed and not deleted: this process is the candidate, and Windows
+        // deletes no `.exe` while it runs.
+        assert_eq!(
+            std::fs::read(&bench.paths.rejected).unwrap(),
+            bench.artifact
+        );
+
+        let held = bench.journal.load().unwrap();
+        assert!(held.probation.is_none());
+        assert_eq!(held.rejected.as_deref(), Some(candidate.as_str()));
+        assert_eq!(
+            held.leftovers,
+            [Leftover {
+                file: Spare::Rejected,
+                sha256: candidate
+            }]
+        );
+        assert_eq!(
+            spy::bodies(&sent, EVENT_TOPIC).last().unwrap()["state"],
+            "rolled_back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_candidate_is_deleted_by_a_later_start_and_not_forgotten_before() {
+        let mut bench = on_probation_on_windows().await;
+        let (publisher, _sent) = spy::publisher();
+        settle(&mut bench.updater, &publisher, &failing("no reply")).await;
+
+        // The first start after the rollback, and something still has the
+        // parked file open.
+        bench.restart_into("1.3.0");
+        bench.updater.locked = vec![bench.paths.rejected.clone()];
+        assert_eq!(
+            settle(&mut bench.updater, &publisher, &Registry::default()).await,
+            Next::Carry
+        );
+        assert!(bench.paths.rejected.exists());
+        assert_eq!(
+            bench.journal.load().unwrap().leftovers.len(),
+            1,
+            "kept for the next try"
+        );
+
+        // The start after that is let.
+        bench.updater.locked.clear();
+        assert_eq!(
+            settle(&mut bench.updater, &publisher, &Registry::default()).await,
+            Next::Carry
+        );
+        assert!(!bench.paths.rejected.exists());
+        assert!(bench.journal.load().unwrap().leftovers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn on_windows_an_old_binary_that_will_not_go_is_recorded_rather_than_blocking() {
+        // A kept update whose `.old` is held open, by a scanner reading the
+        // binary the last process ran from.
+        let mut bench = on_probation_on_windows().await;
+        let replaced = sha256_file(&bench.paths.previous).unwrap();
+        bench.updater.locked = vec![bench.paths.previous.clone()];
+        let (publisher, sent) = spy::publisher();
+
+        assert_eq!(
+            settle(&mut bench.updater, &publisher, &passing()).await,
+            Next::Carry
+        );
+        assert_eq!(
+            spy::bodies(&sent, EVENT_TOPIC).last().unwrap()["state"],
+            "succeeded"
+        );
+        let held = bench.journal.load().unwrap();
+        assert!(held.probation.is_none());
+        assert_eq!(
+            held.leftovers,
+            [Leftover {
+                file: Spare::Previous,
+                sha256: replaced
+            }]
+        );
+        assert!(bench.paths.previous.exists());
+
+        // The next start deletes it, rather than reporting a spare binary
+        // nobody can account for and refusing every update until a person
+        // deletes it.
+        bench.updater.locked.clear();
+        settle(&mut bench.updater, &publisher, &Registry::default()).await;
+        assert!(!bench.paths.previous.exists());
+        assert!(bench.journal.load().unwrap().leftovers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_leftover_old_binary_is_tried_again_before_an_update_rather_than_refusing_it() {
+        // A device can run for months between starts, so waiting for one
+        // would refuse every update for all of them.
+        let mut bench = on_probation_on_windows().await;
+        bench.updater.locked = vec![bench.paths.previous.clone()];
+        let (publisher, _sent) = spy::publisher();
+        settle(&mut bench.updater, &publisher, &passing()).await;
+        let next = bench.serve(b"the build after that", "1.5.0").await;
+
+        // Still held: refused, with a sentence that says what is holding it.
+        let error = bench.updater.install(&publisher, &next).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Windows will not let it be deleted yet"),
+            "{error}"
+        );
+
+        // Let go, and the same announcement installs with no restart between.
+        bench.updater.locked.clear();
+        assert_eq!(
+            bench.updater.install(&publisher, &next).await.unwrap(),
+            Next::Restart {
+                into: "1.5.0".to_string()
+            }
+        );
+        assert_eq!(
+            std::fs::read(&bench.paths.previous).unwrap(),
+            bench.artifact,
+            "the new `.old` is the build that was running"
+        );
+        assert!(bench.journal.load().unwrap().leftovers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_leftover_that_holds_something_else_now_is_left_alone() {
+        // REFUSE TO GUESS, again. Somebody put a binary at `.old` after the
+        // record was made, and deleting it could destroy the only copy.
+        let mut bench = Bench::new().await;
+        bench.updater.platform = Platform::Windows;
+        std::fs::write(&bench.paths.previous, b"somebody else's binary").unwrap();
+        bench
+            .journal
+            .update(|journal| journal.leave(Spare::Previous, &"aa".repeat(32)))
+            .unwrap();
+        let (publisher, _sent) = spy::publisher();
+
+        settle(&mut bench.updater, &publisher, &Registry::default()).await;
+        assert_eq!(
+            std::fs::read(&bench.paths.previous).unwrap(),
+            b"somebody else's binary"
+        );
+        assert!(
+            bench.journal.load().unwrap().leftovers.is_empty(),
+            "and the record that no longer describes it is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_windows_a_rollback_cut_off_before_its_journal_is_finished_by_the_next_start() {
+        let mut bench = on_probation_on_windows().await;
+        let candidate = bench.updater.running.sha256.clone();
+        // Both renames, and then the power goes before the journal is written.
+        assert!(bench.updater.restore().unwrap());
+        bench.restart_into("1.3.0");
+        let (publisher, sent) = spy::publisher();
+
+        assert_eq!(
+            settle(&mut bench.updater, &publisher, &Registry::default()).await,
+            Next::Carry
+        );
+        assert!(
+            !bench.paths.rejected.exists(),
+            "the marker names the candidate, so the parked file is known"
+        );
+        let held = bench.journal.load().unwrap();
+        assert!(held.probation.is_none());
+        assert_eq!(held.rejected.as_deref(), Some(candidate.as_str()));
+        assert!(held.leftovers.is_empty());
+        assert_eq!(
+            spy::bodies(&sent, EVENT_TOPIC).last().unwrap()["state"],
+            "failed"
+        );
+    }
+
+    #[test]
+    fn on_windows_a_rollback_that_cannot_finish_puts_the_candidate_back() {
+        // No `.old` to restore, so the second rename fails with the candidate
+        // already moved aside: nothing is at the path the service manager
+        // starts until it is moved back.
+        let home = tempfile::tempdir().unwrap();
+        let binary = home.path().join("device.exe");
+        std::fs::write(&binary, b"the candidate").unwrap();
+        let mut updater = Updater::new(
+            Paths::beside(binary.clone()),
+            Firmware {
+                version: "1.4.0".to_string(),
+                sha256: "whatever".to_string(),
+            },
+            home.path().join("artifact-key.pem"),
+            journal::Store::beside(&home.path().join("state.json")),
+            Arc::new(Notify::new()),
+        )
+        .unwrap();
+        updater.platform = Platform::Windows;
+
+        let error = updater.restore().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read(&binary).unwrap(), b"the candidate");
+        assert!(!updater.paths.rejected.exists());
+    }
+
+    #[tokio::test]
+    async fn on_unix_a_rollback_is_one_rename_and_leaves_nothing_behind() {
+        // What Linux has always done, whichever machine runs the test.
+        let mut bench = on_probation().await;
+        bench.updater.platform = Platform::Unix;
+        let (publisher, _sent) = spy::publisher();
+
+        let next = settle(&mut bench.updater, &publisher, &failing("no reply")).await;
+        assert!(matches!(next, Next::Restart { .. }), "{next:?}");
+        assert_eq!(
+            std::fs::read(&bench.paths.binary).unwrap(),
+            b"the firmware that is running"
+        );
+        assert!(!bench.paths.rejected.exists());
+        assert!(bench.journal.load().unwrap().leftovers.is_empty());
     }
 }
