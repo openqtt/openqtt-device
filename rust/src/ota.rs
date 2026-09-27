@@ -218,6 +218,9 @@ impl Paths {
     /// Windows answers with the path the loader recorded when the process
     /// started, and renaming the file later does not change it. Read once at
     /// startup, as here, that is the path the service manager starts.
+    ///
+    /// macOS answers with the path the process was started by, which a rename
+    /// does not change either, and which can be a link: see `resolved`.
     pub fn running() -> Result<Paths> {
         let binary = std::env::current_exe().map_err(|error| {
             Error::Ota(format!(
@@ -233,8 +236,36 @@ impl Paths {
                 binary.display()
             )));
         }
-        Ok(Paths::beside(binary))
+        Ok(Paths::beside(resolved(binary)?))
     }
+}
+
+/// The file itself, when the path the process was started by is a link to it.
+///
+/// LINUX ALREADY ANSWERS WITH THE FILE, because `/proc/self/exe` is the file,
+/// so an update lands beside the binary however the unit file names it. macOS
+/// answers with the path given to exec, which its man page for
+/// `_NSGetExecutablePath` calls "a path" rather than "a real path". Staged
+/// beside a link, an update would rename the link to `.old`, put the new
+/// binary where the link was, and leave the old binary wherever the link
+/// pointed, for good. Resolved once here, it lands beside the file, as it does
+/// on Linux, and the link goes on naming it.
+#[cfg(target_os = "macos")]
+fn resolved(binary: PathBuf) -> Result<PathBuf> {
+    std::fs::canonicalize(&binary).map_err(|error| {
+        Error::Ota(format!(
+            "this device cannot tell which file {} is, so it cannot replace it: \
+             {error}",
+            binary.display()
+        ))
+    })
+}
+
+/// Everywhere else the path already names the file, or, on Windows, the one
+/// the service control manager starts.
+#[cfg(not(target_os = "macos"))]
+fn resolved(binary: PathBuf) -> Result<PathBuf> {
+    Ok(binary)
 }
 
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
@@ -2841,5 +2872,35 @@ yp3pqun9aUO9CpufgZkRA9Rf9OuZHwqLxAK+KcLrF+kjRm9hCqbAYgyG6w==\n\
         );
         assert!(!bench.paths.rejected.exists());
         assert!(bench.journal.load().unwrap().leftovers.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_an_update_lands_beside_the_file_a_link_names() {
+        // THE CASE: the plist names a link, `bin/device`, to the binary in
+        // the folder it really lives in. Staged beside the link, the update
+        // would replace the link and strand the old binary for good.
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("libexec").join("device");
+        let link = home.path().join("bin").join("device");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"the firmware that is running").unwrap();
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+
+        let paths = Paths::beside(resolved(link.clone()).unwrap());
+        // Resolved the whole way, as Linux's answer is: the temporary folder
+        // is itself under a link on macOS, `/var` into `/private/var`.
+        let file = std::fs::canonicalize(&file).unwrap();
+        assert_eq!(paths.binary, file);
+        assert_eq!(paths.staged.parent(), file.parent());
+        assert_eq!(paths.previous.parent(), file.parent());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "and the link is left naming it"
+        );
     }
 }
