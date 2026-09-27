@@ -28,11 +28,12 @@
 //!
 //! # The order, which is the whole design
 //!
-//! Verify the signature before a byte is written. Download and hash. Write the
-//! probation marker BEFORE the two renames, because that marker is the only
-//! thing that makes a power cut between them recoverable. Rename the running
-//! binary aside, rename the new one into place, say goodbye, exit 73. Come back
-//! up, run every gating test, and either keep it or put the old one back.
+//! Refuse a build announced for another machine. Verify the signature before a
+//! byte is written. Download and hash. Write the probation marker BEFORE the
+//! two renames, because that marker is the only thing that makes a power cut
+//! between them recoverable. Rename the running binary aside, rename the new
+//! one into place, say goodbye, exit 73. Come back up, run every gating test,
+//! and either keep it or put the old one back.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -101,6 +102,11 @@ pub(crate) struct Announcement {
     /// naming it in the log is what makes a rotation debuggable.
     #[serde(default)]
     pub key_version: Option<String>,
+    /// The triple the artifact was built for, as `aarch64-unknown-linux-gnu`.
+    /// Absent from a platform that predates it, and the announcement is then
+    /// taken exactly as it was before the field existed.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 /// What this device is running, and the only honest answer to that question.
@@ -133,8 +139,16 @@ impl Firmware {
     /// have announced success was replaced mid-sentence. Judge a rollout by
     /// what a device reports running, never by whether it managed to announce
     /// that it finished.
+    ///
+    /// `target` is the triple the running binary was compiled for, and it is
+    /// ground truth for the same reason: it is compiled into the code that is
+    /// answering, so it cannot describe some other binary.
     pub fn meta(&self) -> serde_json::Value {
-        serde_json::json!({ "version": self.version, "sha256": self.sha256 })
+        serde_json::json!({
+            "version": self.version,
+            "sha256": self.sha256,
+            "target": crate::TARGET,
+        })
     }
 }
 
@@ -199,9 +213,10 @@ pub(crate) struct Updater {
     journal: journal::Store,
     http: reqwest::Client,
     flushed: Arc<Notify>,
-    /// The last sha refused for being on the rejected list. The announcement
-    /// is retained, so without this every reconnect republishes the same
-    /// refusal for the rest of the device's life.
+    /// The last sha refused in a way the next delivery could only repeat: it
+    /// is on the rejected list, or it was built for another machine. The
+    /// announcement is retained, so without this every reconnect republishes
+    /// the same refusal for the rest of the device's life.
     refused: Option<String>,
 }
 
@@ -291,6 +306,33 @@ impl Updater {
         // redelivered on every reconnect with no job-id file anywhere.
         if announced.sha256.eq_ignore_ascii_case(&self.running.sha256) {
             return Ok(Next::Carry);
+        }
+
+        // A BUILD FOR ANOTHER MACHINE STOPS HERE, BEFORE THE JOURNAL, THE KEY
+        // OR THE NETWORK. It would pass the signature and the digest, swap in,
+        // and fail `Exec format error` the first time the service manager
+        // started it, where the rollback that lives inside the binary never
+        // runs. The platform filters by target before it announces, so this
+        // catches the platform being wrong. It is not a trust decision: the
+        // signature covers the digest and not this field.
+        //
+        // NOT REJECTED, and the journal is not touched. Nothing is wrong with
+        // the build, only with where it was sent, and the platform may send
+        // the right one, under this same sha if the label was what was wrong.
+        if let Some(built_for) = announced
+            .target
+            .as_deref()
+            .filter(|built_for| *built_for != crate::TARGET)
+        {
+            // Said once per process, for the reason `refused` gives.
+            if self.refused.as_deref() == Some(announced.sha256.as_str()) {
+                return Ok(Next::Carry);
+            }
+            self.refused = Some(announced.sha256.clone());
+            return Err(Error::Ota(format!(
+                "built for {built_for}, this device is {}",
+                crate::TARGET
+            )));
         }
 
         let mut held = self.journal.load()?;
@@ -1125,6 +1167,7 @@ mod tests {
     use super::*;
     use crate::mqtt::spy;
     use crate::tests::{Outcome, Probe};
+    use crate::TARGET;
     use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair as _, ECDSA_P256_SHA256_ASN1_SIGNING};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1187,7 +1230,7 @@ mod tests {
     /// A device with a binary, a key on disk and somewhere to write.
     struct Bench {
         _home: tempfile::TempDir,
-        _server: MockServer,
+        server: MockServer,
         updater: Updater,
         journal: journal::Store,
         paths: Paths,
@@ -1233,7 +1276,7 @@ mod tests {
             let url = format!("{}/artifact", server.uri());
             Bench {
                 _home: home,
-                _server: server,
+                server,
                 updater,
                 journal,
                 paths,
@@ -1244,6 +1287,10 @@ mod tests {
         }
 
         /// A well formed announcement for the artifact this bench serves.
+        ///
+        /// With no target, which is what a platform that predates the field
+        /// sends, so every test that does not set one is also proof that an
+        /// announcement without it is handled exactly as it always was.
         fn announcement(&self) -> Announcement {
             let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &self.artifact);
             Announcement {
@@ -1252,6 +1299,7 @@ mod tests {
                 url: self.url.clone(),
                 signature: self.signer.sign(digest.as_ref()),
                 key_version: Some("projects/openqtt-prod/.../cryptoKeyVersions/1".to_string()),
+                target: None,
             }
         }
     }
@@ -1338,6 +1386,134 @@ mod tests {
         assert!(spy::bodies(&sent, PROGRESS_TOPIC).is_empty());
     }
 
+    /// A triple that is not this device's, whichever machine runs the tests.
+    fn another_target() -> &'static str {
+        if TARGET == "x86_64-unknown-linux-gnu" {
+            "aarch64-unknown-linux-gnu"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        }
+    }
+
+    /// An announcement as the platform publishes it, before `target` existed.
+    fn without_target(signed: &Announcement) -> serde_json::Value {
+        serde_json::json!({
+            "version": signed.version,
+            "sha256": signed.sha256,
+            "url": signed.url,
+            "signature": signed.signature,
+            "key_version": signed.key_version,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_build_for_another_machine_is_refused_before_anything_is_fetched() {
+        // THE CASE THIS EXISTS FOR: an x86-64 binary announced to an arm64
+        // device. It passes the signature and the digest, swaps in, fails
+        // `Exec format error` under systemd, and the rollback inside the
+        // binary never runs, so the device is dark until somebody puts `.old`
+        // back by hand.
+        let mut bench = Bench::new().await;
+        let (publisher, sent) = spy::publisher();
+        let elsewhere = another_target();
+        let mut payload = without_target(&bench.announcement());
+        payload["target"] = serde_json::json!(elsewhere);
+        let announced: Announcement = serde_json::from_value(payload).unwrap();
+
+        assert_eq!(
+            bench.updater.accept(&publisher, &announced).await,
+            Next::Carry
+        );
+
+        // Not asked for, not written, not swapped.
+        assert!(
+            bench.server.received_requests().await.unwrap().is_empty(),
+            "the CDN was never asked"
+        );
+        assert!(!bench.paths.staged.exists());
+        assert_eq!(
+            std::fs::read(&bench.paths.binary).unwrap(),
+            b"the firmware that is running"
+        );
+
+        // One message and nothing else: no `started`, no progress.
+        let said = spy::published(&sent);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0, EVENT_TOPIC);
+        let event: serde_json::Value = serde_json::from_slice(&said[0].1).unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "version": "1.4.0",
+                "sha256": announced.sha256,
+                "state": "failed",
+                "message": format!("built for {elsewhere}, this device is {TARGET}"),
+            })
+        );
+
+        // Not rejected: nothing is wrong with the build, only with where it
+        // was sent.
+        let held = bench.journal.load().unwrap();
+        assert!(held.rejected.is_none(), "{held:?}");
+        assert!(held.probation.is_none());
+
+        // Said once, and not again on every redelivery of a retained message.
+        assert_eq!(
+            bench.updater.accept(&publisher, &announced).await,
+            Next::Carry
+        );
+        assert!(spy::published(&sent).is_empty());
+
+        // So the platform can send the right one, even under this same sha
+        // when the label was what was wrong, which a rejected sha would have
+        // refused for good.
+        let mut right = announced.clone();
+        right.target = Some(TARGET.to_string());
+        assert_eq!(
+            bench.updater.install(&publisher, &right).await.unwrap(),
+            Next::Restart {
+                into: "1.4.0".to_string()
+            }
+        );
+        assert_eq!(std::fs::read(&bench.paths.binary).unwrap(), bench.artifact);
+    }
+
+    #[tokio::test]
+    async fn an_announcement_with_no_target_is_installed_as_it_always_was() {
+        // WHAT A PLATFORM THAT PREDATES THE FIELD SENDS. The check is a second
+        // line behind the platform's own filter, not a new condition on every
+        // update, so its absence changes nothing.
+        let mut bench = Bench::new().await;
+        let (publisher, _sent) = spy::publisher();
+        let announced: Announcement =
+            serde_json::from_value(without_target(&bench.announcement())).unwrap();
+        assert_eq!(announced.target, None);
+
+        assert_eq!(
+            bench.updater.install(&publisher, &announced).await.unwrap(),
+            Next::Restart {
+                into: "1.4.0".to_string()
+            }
+        );
+        assert_eq!(std::fs::read(&bench.paths.binary).unwrap(), bench.artifact);
+    }
+
+    #[test]
+    fn meta_firmware_says_which_machine_the_running_binary_is_for() {
+        let running = Firmware {
+            version: "1.3.0".to_string(),
+            sha256: "9f".repeat(32),
+        };
+        assert_eq!(
+            running.meta(),
+            serde_json::json!({
+                "version": "1.3.0",
+                "sha256": "9f".repeat(32),
+                "target": TARGET,
+            })
+        );
+    }
+
     #[tokio::test]
     async fn bytes_that_are_not_the_bytes_that_were_signed_are_thrown_away() {
         let mut bench = Bench::with_artifact(b"one thing".to_vec()).await;
@@ -1350,6 +1526,7 @@ mod tests {
             url: bench.url.clone(),
             signature: bench.signer.sign(digest.as_ref()),
             key_version: None,
+            target: None,
         };
 
         let error = bench

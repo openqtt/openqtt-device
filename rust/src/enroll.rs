@@ -48,6 +48,13 @@ struct Request<'a> {
     device: &'a str,
     token: &'a str,
     csr: &'a str,
+    /// The triple this binary was compiled for: see [`crate::TARGET`].
+    ///
+    /// ON EVERY ENROLLMENT AND NOT ONLY THE FIRST, because the api records
+    /// whatever the last one said. A renewal is what keeps that true after an
+    /// update, and it is how a device that started on a version which sent
+    /// nothing becomes one the platform can send a build to.
+    target: &'a str,
 }
 
 /// The response, field for field. `extra="forbid"` on the api's side means this
@@ -100,7 +107,12 @@ impl Client {
         let response = self
             .http
             .post(&self.url)
-            .json(&Request { device, token, csr })
+            .json(&Request {
+                device,
+                token,
+                csr,
+                target: crate::TARGET,
+            })
             .send()
             .await
             .map_err(|source| Error::Transport {
@@ -244,16 +256,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_body_is_the_three_fields_the_api_accepts() {
+    async fn the_body_is_the_four_fields_the_api_accepts() {
         // `extra="forbid"` on the api's side, so an extra field is a 422 and
-        // a renamed one is a silent nothing. Pin the shape.
+        // a renamed one is a silent nothing. Pin the shape. The same rule is
+        // why an api that predates `target` refuses this body outright: it
+        // has to accept the field before a device that sends it is deployed.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/enroll"))
             .and(body_json(serde_json::json!({
                 "device": "acme/production/pump-3",
                 "token": "oqe_first",
-                "csr": "a csr"
+                "csr": "a csr",
+                "target": crate::TARGET
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(issued()))
             .mount(&server)
@@ -264,6 +279,19 @@ mod tests {
             .enroll("acme/production/pump-3", "oqe_first", "a csr")
             .await
             .unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "x86", ignore = "32 bit x86 triples start i686, not x86")]
+    fn the_target_names_the_architecture_this_was_compiled_for() {
+        // Every other test compares against the same constant, so this is the
+        // one that notices `build.rs` exporting something else. A prefix,
+        // because `ARCH` says `arm` for every 32 bit ARM triple.
+        assert!(
+            crate::TARGET.starts_with(std::env::consts::ARCH),
+            "{}",
+            crate::TARGET
+        );
     }
 
     #[tokio::test]

@@ -1,9 +1,38 @@
 # The device protocol
 
-What a device and the platform say to each other over MQTT, so that two
-implementations of the same client agree. `rust/` is the first; `c/` will be the
-second, and this file exists because the cheapest moment to keep them the same
-is before the second one is written.
+What a device and the platform say to each other, over MQTT and in the one HTTP
+call that enrols a device, so that two implementations of the same client agree.
+`rust/` is the first; `c/` will be the second, and this file exists because the
+cheapest moment to keep them the same is before the second one is written.
+
+## Enrollment, the one call that is not MQTT
+
+`POST /api/v1/enroll`, for a device's first certificate and every renewal after
+it.
+
+```json
+{
+  "device": "acme/production/pump-3",
+  "token": "oqe_...",
+  "csr": "-----BEGIN CERTIFICATE REQUEST-----\n...",
+  "target": "aarch64-unknown-linux-gnu"
+}
+```
+
+`target` is the Rust target triple the running binary was compiled for, taken
+from the compiler rather than the machine: `uname -m` says `aarch64` and cannot
+say glibc or musl. It is how the platform knows which build to send a device.
+It goes in every enrollment and not only the first, because the platform keeps
+whatever the last one said and a renewal is what keeps that true after an
+update. A triple the platform does not know is a 422 `UNKNOWN_TARGET`, and one
+the device's namespace has not enabled is a 409 `TARGET_NOT_ENABLED` whose
+message names what to add in the namespace settings. A device that has never
+sent one is still enrolled and is sent no updates, because nothing says which
+build it takes.
+
+**Unlike every payload below, this body is closed.** The api refuses a field it
+does not know with a 422, so a new field here reaches devices after the api
+accepts it and never before.
 
 ## Everything is relative, and the broker prepends the rest
 
@@ -36,7 +65,8 @@ A zero-byte retained payload clears the topic and means "nothing desired".
   "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "url": "https://cdn.openqtt.com/artifacts/9f86d081...",
   "signature": "MEUCIQD...",
-  "key_version": "projects/openqtt-prod/locations/.../cryptoKeyVersions/1"
+  "key_version": "projects/openqtt-prod/locations/.../cryptoKeyVersions/1",
+  "target": "aarch64-unknown-linux-gnu"
 }
 ```
 
@@ -48,6 +78,30 @@ persisted job-id file.
 `signature` is ECDSA P-256 over the raw 32 bytes of `sha256`, DER, base64. The
 device verifies it against the artifact key before writing anything. The CDN is
 a distribution point and never a trust anchor.
+
+**`target` is the triple the artifact was built for, and a device refuses a
+build for another machine before fetching it.** Installed, it would pass the
+signature and the digest, swap in, and fail `Exec format error` the first time
+the service manager started it, where the rollback that lives inside the binary
+never runs. The platform already sends each device only the build for its own
+target, so this catches the platform being wrong, and it is not a trust
+decision: the signature covers the digest and not this field. The refusal goes
+out on `ota/event`:
+
+```json
+{
+  "version": "1.4.0",
+  "sha256": "9f86...",
+  "state": "failed",
+  "message": "built for x86_64-unknown-linux-gnu, this device is aarch64-unknown-linux-gnu"
+}
+```
+
+It is said once each time the device starts rather than on every redelivery,
+and unlike a build that failed its gating test, the sha is not remembered as one
+never to install. Nothing is wrong with the build, only with where it was sent,
+so the platform can send the right one. With `target` absent or `null`, from a
+platform that predates the field, the announcement is taken as it always was.
 
 ### `commands/test`
 
@@ -99,13 +153,17 @@ the retained store becomes control-plane state that a device can write to.
 ### `meta/firmware`, on every connect
 
 ```json
-{ "version": "1.4.0", "sha256": "9f86d081..." }
+{ "version": "1.4.0", "sha256": "9f86d081...", "target": "aarch64-unknown-linux-gnu" }
 ```
 
 **Ground truth, and the reason it is sent on every connect rather than retained
 once.** Installing an update means restarting, so the process that would have
 announced success was replaced mid-sentence. Judge a rollout by what a device
 reports running, never by whether it managed to announce that it finished.
+
+`target` is the triple the running binary was compiled for, the same value the
+device sends when it enrols. It is ground truth for the same reason: it is
+compiled into the process that is answering.
 
 ### `status/<kind>`
 
@@ -220,3 +278,8 @@ is either desired state, which an old device compares and ignores what it does
 not understand, or a report, which the platform reads field by field. A device
 that meets a field it does not know skips it. If that ever stops being enough,
 the answer is a new topic, not a version number inside an old one.
+
+`target` on `commands/firmware` is the first field an old device cannot safely
+skip, since skipping it means installing whatever it is sent. The platform
+covers that rather than the payload: it announces only to devices that reported
+a target when they enrolled, so a device older than the field is sent nothing.
