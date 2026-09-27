@@ -923,15 +923,6 @@ pub(crate) async fn settle(
                 proving.version
             );
             tracing::error!("{why}");
-            // Recorded as rejected for the same reason a rollback is: the
-            // announcement is retained, so a candidate that cannot boot would
-            // otherwise be installed again on the next connect, forever.
-            if let Err(error) = updater.journal.update(|journal| {
-                journal.probation = None;
-                journal.rejected = Some(proving.sha256.clone());
-            }) {
-                tracing::error!(%error, "could not record that this update never booted");
-            }
             let _ = remove_if_present(&updater.paths.staged);
             let windows = updater.platform == Platform::Windows;
             let mut left = Vec::new();
@@ -957,7 +948,7 @@ pub(crate) async fn settle(
             // parked file is deleted only if it is that binary.
             //
             // ONE THAT CANNOT BE READ YET IS RECORDED, NOT FORGOTTEN. The
-            // marker is cleared above, so without a record nothing would ever
+            // marker is cleared below, so without a record nothing would ever
             // try again, and an install refuses while `.rejected` exists: a
             // passing lock would block every update for good. `tidy` checks
             // the recorded sha before it deletes anything.
@@ -975,14 +966,23 @@ pub(crate) async fn settle(
                     Err(_) => left.push((Spare::Rejected, proving.sha256.clone())),
                 }
             }
-            if !left.is_empty() {
-                if let Err(error) = updater.journal.update(|journal| {
-                    for (file, sha256) in &left {
-                        journal.leave(*file, sha256);
-                    }
-                }) {
-                    tracing::error!(%error, "could not record the binaries left to delete");
+            // ONE JOURNAL WRITE, AFTER THE FILES. Clearing the marker and
+            // recording what is left are one update, so a stop between them
+            // cannot drop the only record of a parked candidate. The file work
+            // above is safe to repeat: a stop before this write leaves the
+            // marker standing, and the next start comes back through here.
+            //
+            // Recorded as rejected for the same reason a rollback is: the
+            // announcement is retained, so a candidate that cannot boot would
+            // otherwise be installed again on the next connect, forever.
+            if let Err(error) = updater.journal.update(|journal| {
+                journal.probation = None;
+                journal.rejected = Some(proving.sha256.clone());
+                for (file, sha256) in &left {
+                    journal.leave(*file, sha256);
                 }
+            }) {
+                tracing::error!(%error, "could not record that this update never booted");
             }
             event(publisher, &proving.version, &proving.sha256, "failed", &why).await;
         }
