@@ -51,6 +51,75 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
+  # Windows, compiled from Linux the way builder/Dockerfile compiles it: the
+  # same mingw-w64 variant, and NASM for aws-lc-sys. Checking does not link,
+  # and the linker is the half of a cross build that fails, so every test
+  # binary and example is built as well as linted.
+  windows-gnu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64-posix nasm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Lint
+        run: cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets --all-features -- -D warnings
+
+      - name: Link
+        run: cargo test --locked --target x86_64-pc-windows-gnu --all-features --no-run
+
+  # Natively, because what Windows does to a running .exe and what its service
+  # manager does with an exit 73 are behaviours rather than types, and only
+  # Windows has them. The toolchain here is the runner's own, MSVC, rather
+  # than the gnu target the builder ships: the code under test is the same,
+  # and the gnu link is the job above.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    env:
+      # aws-lc-sys assembles NASM sources on x86-64 Windows. With NASM on the
+      # runner it uses it; without, this lets it use the same sources
+      # assembled upstream. The builder image assembles them itself.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Tests
+        run: cargo test --locked --all-features
+
+      # Registers a real service, starts it, and proves that exit 73 and a
+      # stop with an error both restart it. A step of its own so a failure
+      # names the claim that broke. It needs an elevated runner, which this is.
+      - name: Service manager
+        env:
+          OPENQTT_SCM_TEST: "1"
+        run: cargo test --locked --all-features --test service_manager
+
   # The house-wide copy rule, gated rather than remembered.
   copy:
     runs-on: ubuntu-latest

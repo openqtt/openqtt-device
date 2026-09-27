@@ -16,7 +16,7 @@ without a restart.
 
 | | what | for | state |
 | --- | --- | --- | --- |
-| `openqtt-device` | Rust crate | a program under Linux | **here** |
+| `openqtt-device` | Rust crate | a program under Linux or Windows | **here** |
 | `libopenqtt-device` | ESP-IDF component | firmware on bare metal | planned, `c/` |
 | `openqtt-consumer` | Python package | reading the data back out | blocked |
 
@@ -51,6 +51,9 @@ export OPENQTT_TOKEN=oqe_...                   # first run only
 the first enrollment and every one after that, and the current value lives in
 the state file. Once a device has enrolled, the variable is ignored and
 deleting it is the right thing to do.
+
+On Windows the files live under `%ProgramData%\OpenQTT` instead, and the
+folder has to be made private before the first run: see [Windows](#windows).
 
 ### The root certificate is not optional
 
@@ -87,6 +90,9 @@ purpose.
 | `OPENQTT_BROKER` | `mqtt.broker-yyz.openqtt.com:8883` | `host:port`, `mqtts://...` or `wss://host:port/mqtt` |
 | `OPENQTT_LOGS` | `https://logs.broker-yyz.openqtt.com/v1/logs` | where batched log lines go. `https`, or a loopback address |
 | `OPENQTT_CONNECT_TIMEOUT` | `30` | seconds to wait for the first connection |
+
+On Windows the three paths default to `%ProgramData%\OpenQTT\` rather than
+`/etc/openqtt/`, which is `C:\ProgramData\OpenQTT\` unless somebody moved it.
 
 Nothing is read from a config file, deliberately. A file that fails to parse
 and a file that is not there are hard to tell apart, and a device that quietly
@@ -265,6 +271,9 @@ Both lines. `Restart=on-failure` is the trap: it reads the same declaration,
 concludes that 73 is success, does not restart, and leaves the service dead
 after every successful update.
 
+On Windows the service control manager plays this part, and it needs two
+settings of its own and a binary that talks to it: see [Windows](#windows).
+
 **On the way back up it has to prove itself.** Every gating probe runs. All
 pass and the update is kept. One fails and the old binary goes back, the device
 exits 73 again, and the probe's own message rides out on `ota/event`. A probe
@@ -408,6 +417,147 @@ And from the other side, with a service credential:
 mosquitto_sub -h <broker> -p 1883 -t 'ingest/acme/production/pump-3/#' -v
 ```
 
+## Windows
+
+x86-64, Windows 10 or Server 2016 and later, built for `x86_64-pc-windows-gnu`.
+The device does the same things and says the same things on the wire. What
+changes is where its files live, what keeps them private, and what starts it
+again after an update.
+
+### Where things live
+
+```text
+C:\Program Files\OpenQTT\device.exe       the binary; updates are staged beside it
+C:\ProgramData\OpenQTT\root.pem           OPENQTT_ROOT_CA
+C:\ProgramData\OpenQTT\artifact-key.pem   OPENQTT_ARTIFACT_KEY
+C:\ProgramData\OpenQTT\state.json         OPENQTT_STATE, written by the device
+C:\ProgramData\OpenQTT\journal.json       beside it, written by the device
+```
+
+The defaults read `%ProgramData%`, so a machine that moved it is followed. The
+build the platform makes for this target is `<bin>.exe`, because that is what
+cargo writes for it. Updates are written beside the binary, so the service's
+account has to be able to write to that folder, which LocalSystem, the account
+`sc.exe create` uses unless told otherwise, can.
+
+**The crate sets no permissions on Windows, and ProgramData is not private by
+default.** On Linux it creates the state file 0600 in a 0700 directory, and
+tightens a directory that is more open than that. Windows has no mode to set: a
+file takes the ACL of the folder it is created in, and every local user can
+read what is under `%ProgramData%` unless the folder says otherwise. So the
+folder is made private once, at installation, and everything the device writes
+into it inherits that. From an elevated Command Prompt:
+
+```bat
+mkdir "%ProgramData%\OpenQTT"
+icacls "%ProgramData%\OpenQTT" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F
+```
+
+That leaves SYSTEM, which the service runs as, and Administrators, and nobody
+else. The two SIDs rather than their names, because the names are translated on
+a Windows that is not in English. Then copy `root.pem` and `artifact-key.pem`
+into it.
+
+### Enrol by hand, then install the service
+
+The binary a service runs can also be run from a prompt, and the first run is
+the one worth watching. From the same elevated prompt:
+
+```bat
+set OPENQTT_DEVICE=acme/production/pump-3
+set OPENQTT_TOKEN=oqe_...
+"C:\Program Files\OpenQTT\device.exe"
+```
+
+Stop it with Ctrl+C once it says it is connected. The rotated token is in
+`state.json` now, which is why the bootstrap token never has to go into the
+service's own configuration, where it would sit long after its use.
+
+```bat
+sc.exe create openqtt-device binPath= "\"C:\Program Files\OpenQTT\device.exe\"" start= auto
+sc.exe failure openqtt-device reset= 0 actions= restart/2000
+sc.exe failureflag openqtt-device 1
+sc.exe start openqtt-device
+```
+
+Three things in there are easy to get wrong.
+
+**The quotes inside `binPath`.** Without them the path is read at its first
+space, and Windows tries `C:\Program.exe` before the binary if one is there.
+The space after each `=` is sc.exe's syntax, not a typo.
+
+**`failure` is `Restart=always`, and without it a device is dead after its
+first update.** An update ends by exiting 73. The service control manager
+counts a process that ends without saying it stopped as a failure, whatever the
+code, and a failure restarts the service only when a recovery action says so.
+There is none by default. With one action and `reset= 0`, every failure gets
+the same answer: start it again two seconds later.
+
+**`failureflag` covers the other way a device stops.** An error returned from
+the service's `main` is reported to the SCM as a stop with an error, and that
+counts as a failure only with the flag set. Without it such a device stays
+stopped, which is the `Restart=on-failure` trap again in Windows' words.
+
+A variable the service needs, such as `OPENQTT_BROKER` for a namespace on
+WebSocket, goes in its `Environment` value, one `NAME=value` per entry:
+
+```bat
+reg add HKLM\SYSTEM\CurrentControlSet\Services\openqtt-device /v Environment /t REG_MULTI_SZ /d "OPENQTT_BROKER=wss://mqtt.broker-yyz.openqtt.com:8084/mqtt" /f
+```
+
+Anybody who can read the service's configuration can read that, so it is no
+place for the token.
+
+### The binary has to talk to the service manager
+
+A program the service control manager starts has to call
+`StartServiceCtrlDispatcher` within about thirty seconds or it is killed, and
+the start fails with error 1053. An ordinary `main` never does. The crate has
+that conversation behind a feature:
+
+```toml
+openqtt-device = { version = "0.2", features = ["windows-service"] }
+```
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    openqtt_device::service::run("openqtt-device", |stop| {
+        tokio::runtime::Runtime::new()?.block_on(async move {
+            let device = openqtt_device::Device::connect().await?;
+            stop.requested().await;
+            device.shutdown().await;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+    })
+}
+```
+
+The name is the one given to `sc.exe create`. `stop` resolves when the service
+is asked to stop or the machine is shutting down, and never when the binary is
+run by hand, which is what lets the enrollment above use the same binary.
+`rust/examples/windows_service.rs` is the `publish` device written this way. A
+service has no console, so what it prints goes nowhere; `Device::log` reaches
+the platform either way.
+
+### What an update does differently
+
+Nothing on the wire and nothing in the order: refuse another target, verify,
+download beside the binary, write the marker, rename the running binary to
+`.old`, rename the download into its place, exit 73. Windows has always let a
+running `.exe` be renamed, and that is all an install needs.
+
+Putting the old one back is where it differs. Linux renames `.old` over the
+running candidate in one step. Windows cannot be counted on to replace a
+running `.exe`, so a rollback renames the candidate to `device.exe.rejected`
+first, then `.old` into its place. The candidate is still running then and is
+deleted by the next start.
+
+Anything Windows will not let go of at the time, such as a `.old` a virus
+scanner is reading when an update is kept, is written down in the journal and
+tried again at every start and before the next update, and deleted only if it
+still holds what was recorded. Without that, a `.old` nobody could delete would
+refuse every update after it.
+
 ## Layout
 
 ```
@@ -434,6 +584,21 @@ which is what makes the certificate the crate generated, stored and presents
 the same certificate. Updates are exercised against a mock CDN and a key pair
 the test generates, so the signature, the digest, both renames and every
 recovery decision run for real against a temporary directory.
+
+The Windows decisions around an update, parking a running candidate and
+retrying what could not be deleted, run on every machine against a simulated
+lock. What Windows itself does is proven on Windows, by two programs CI runs on
+`windows-latest`. `rust/tests/running_binary.rs` renames and deletes real
+running copies of itself in the crate's order. `rust/tests/service_manager.rs`
+registers a real service with the settings above and checks that exit 73 and a
+stop with an error both start it again; it needs an elevated prompt, so it only
+does that when asked:
+
+```bat
+cd rust
+set OPENQTT_SCM_TEST=1
+cargo test --locked --all-features --test service_manager
+```
 
 `rust/tests/connection.rs` opens a loopback socket that speaks enough MQTT to
 answer a CONNECT. **It is not a broker and it is not evidence about one.** It

@@ -39,6 +39,9 @@
 //! against any of them is accepted, which is what makes the signing key
 //! rotatable. With no key on disk an update is refused rather than installed.
 //!
+//! On Windows the three files default to `%ProgramData%\OpenQTT` instead of
+//! `/etc/openqtt`, and nothing else about them changes.
+//!
 //! # Two things that surprise everybody
 //!
 //! **Publish `temperature`, not `ingest/acme/production/pump-3/temperature`.**
@@ -84,6 +87,20 @@
 //! the restart limiter. `Restart=on-failure` is the trap: it reads the same
 //! declaration, concludes 73 is success, does not restart, and leaves the
 //! service dead after every update.
+//!
+//! # The service, on Windows
+//!
+//! ```text
+//! sc.exe failure <service> reset= 0 actions= restart/2000
+//! sc.exe failureflag <service> 1
+//! ```
+//!
+//! The service control manager restarts a service whose process ends without
+//! saying it stopped, which is what exiting 73 looks like to it, but only with
+//! a recovery action, and there is none by default. It also kills a program
+//! that does not talk to it within about thirty seconds, so a device that runs
+//! as a service goes through `service::run`, behind the `windows-service`
+//! feature. The README has the whole installation.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -98,6 +115,8 @@ mod journal;
 mod mqtt;
 mod ota;
 mod renew;
+#[cfg(all(windows, feature = "windows-service"))]
+pub mod service;
 mod signals;
 mod state;
 mod tests;

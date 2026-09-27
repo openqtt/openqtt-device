@@ -10,6 +10,11 @@
 //! that is briefly world readable was readable.
 //!
 //! `journal.rs` inherits all three instead of learning them again.
+//!
+//! WINDOWS KEEPS THE FIRST TWO AND HAS NO THIRD. There is no mode: a file takes
+//! the ACL of the directory it is created in, which is why the installation
+//! restricts `%ProgramData%\OpenQTT` before the first run rather than this code
+//! restricting each file. See the README.
 
 use std::fs;
 use std::io::Write as _;
@@ -49,9 +54,29 @@ pub(crate) fn write_private(path: &Path, body: &[u8]) -> Result<()> {
     // HALVES ARE CHECKED. Swallowing them, as this did, means returning
     // success while the durability this whole design rests on did not happen.
     // If the claim cannot be made, say so instead.
-    let handle = fs::File::open(directory).map_err(|error| io(directory, error))?;
-    handle.sync_all().map_err(|error| io(directory, error))?;
-    Ok(())
+    sync_directory(directory)
+}
+
+/// Flush a directory, so a rename inside it survives a power cut.
+///
+/// WINDOWS NEEDS TWO THINGS LINUX DOES NOT, and without them this failed on
+/// every save, which for a device means losing the token it had just been
+/// handed. A directory opens at all only with `FILE_FLAG_BACKUP_SEMANTICS`,
+/// and `FlushFileBuffers` refuses a handle that was not opened for writing.
+fn sync_directory(directory: &Path) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // From `winbase.h`. One number, so named here rather than depended on.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    let handle = options
+        .open(directory)
+        .map_err(|error| io(directory, error))?;
+    handle.sync_all().map_err(|error| io(directory, error))
 }
 
 /// The scratch file a replacement is written to, `state.json.new` beside
@@ -107,6 +132,9 @@ fn create_private(path: &Path) -> Result<fs::File> {
 /// If it already exists and is more open than that, tighten it and say so.
 /// Silently leaving a world readable directory around a key is worse than
 /// surprising somebody who chose the permissions on purpose.
+///
+/// On Windows it is created if missing and otherwise left as it is: what
+/// protects the key there is the ACL the installation put on it.
 fn ensure_directory(directory: &Path) -> Result<()> {
     if !directory.exists() {
         let mut builder = fs::DirBuilder::new();

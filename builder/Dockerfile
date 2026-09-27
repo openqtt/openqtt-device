@@ -19,7 +19,7 @@
 # the field. If that is ever the intent, it is a release note, not a bump.
 # ---------------------------------------------------------------------------
 # PINNED TO amd64 BECAUSE CLOUD BUILD IS amd64, and the arch of this image
-# decides which of the three targets is native and which are cross-compiled.
+# decides which of the four targets is native and which are cross-compiled.
 # Built on an arm64 laptop without this, x86_64 becomes a cross target, cc-rs
 # goes looking for `x86_64-linux-gnu-gcc`, and the build fails on the one
 # target that works fine in production. An image that behaves differently
@@ -37,6 +37,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # nothing: rustc cross-compiles natively and only the linker has to be
 # target-aware. QEMU earns its place for RUNNING an ARM binary, which is a
 # later step and a different image.
+#
+# WINDOWS NEEDS TWO MORE, and the second is not a linker. mingw-w64's gcc links
+# PE binaries and compiles the C in `ring` and `aws-lc-sys`: the posix variant
+# rather than win32, because it is the threading model Rust's own windows-gnu
+# toolchain is built with, and the only one whose C++ has `std::thread` for a
+# customer dependency that needs it. NASM because aws-lc-sys assembles NASM
+# sources on every x86-64 Windows target and stops with "NASM command not
+# found" without it. The crate can use objects assembled upstream instead;
+# assembling them here keeps the whole build from source.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
@@ -46,6 +55,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libc6-dev-arm64-cross \
       gcc-arm-linux-gnueabihf \
       libc6-dev-armhf-cross \
+      gcc-mingw-w64-x86-64-posix \
+      nasm \
       pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -70,6 +81,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
          x86_64-unknown-linux-gnu \
          aarch64-unknown-linux-gnu \
          armv7-unknown-linux-gnueabihf \
+         x86_64-pc-windows-gnu \
     && chmod -R a+w "$CARGO_HOME" "$RUSTUP_HOME"
 
 # WHICH LINKER FOR WHICH TARGET. Without this, cargo invokes the host `cc` for
@@ -82,6 +94,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # registers. Linking that against a soft-float sysroot produces a binary that
 # starts and then computes wrong answers, which is worse than one that does not
 # start.
+#
+# `x86_64-pc-windows-gnu` writes `target/<triple>/release/<bin>.exe` where the
+# three Linux targets write `<bin>`, so whatever copies the artifact out has to
+# add the suffix for that one target.
 COPY cargo-config.toml /opt/cargo/config.toml
 
 # The build runs as nobody in particular and writes only where it is told.

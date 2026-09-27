@@ -6,6 +6,12 @@ linker = "aarch64-linux-gnu-gcc"
 [target.armv7-unknown-linux-gnueabihf]
 linker = "arm-linux-gnueabihf-gcc"
 
+# The same name cc-rs looks for when it compiles the C in `ring` and
+# `aws-lc-sys` for this target, so the objects and the final link come from one
+# compiler. The output is `<bin>.exe`.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+
 # Fetch with the git CLI rather than cargo's own implementation. Large
 # dependency trees over a cold network are where cargo's built-in fetcher is
 # slowest, and a build minute is billed.
