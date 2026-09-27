@@ -120,6 +120,47 @@ jobs:
           OPENQTT_SCM_TEST: "1"
         run: cargo test --locked --all-features --test service_manager
 
+  # Natively, on Apple silicon, because what launchd does with an exit 73 and
+  # what the kernel does with a binary an update renamed into place are
+  # behaviours rather than types. Intel is compiled from the same runner:
+  # Apple's toolchain builds both, and nothing in the crate differs by arch.
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # The Linux job never compiles what is behind cfg(target_os = "macos").
+      - name: Lint
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+      # Loads the README's plist into launchd as a real LaunchDaemon, and
+      # proves that exit 73, exit 0 and an exit after a long run all start it
+      # again. A step of its own so a failure names the claim that broke. It
+      # needs root, and sudo on this runner asks for no password.
+      - name: launchd
+        env:
+          OPENQTT_LAUNCHD_TEST: "1"
+        run: cargo test --locked --test launchd
+
+      - name: Intel
+        run: cargo check --locked --target x86_64-apple-darwin --all-targets --all-features
+
   # The house-wide copy rule, gated rather than remembered.
   copy:
     runs-on: ubuntu-latest
