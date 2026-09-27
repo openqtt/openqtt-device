@@ -579,7 +579,7 @@ made on a Mac.
 ### Where things live
 
 ```text
-/usr/local/libexec/openqtt/device                       the binary; updates are staged beside it
+/Library/Application Support/OpenQTT/bin/device        the binary; updates are staged beside it
 /Library/Application Support/OpenQTT/root.pem           OPENQTT_ROOT_CA
 /Library/Application Support/OpenQTT/artifact-key.pem   OPENQTT_ARTIFACT_KEY
 /Library/Application Support/OpenQTT/state.json         OPENQTT_STATE, written by the device
@@ -594,11 +594,23 @@ more open than that, as it does there. The binary has a folder of its own
 because an update writes `device.new` and `device.old` beside it, and the
 daemon runs as root, the one account that should be able to write there.
 
+**NOT UNDER `/usr/local`.** launchd runs this binary as root, so every folder
+above it has to be one only root can change, not just the last one. On an
+Intel Mac with Homebrew, `/usr/local` and its subfolders can belong to the
+Homebrew user, who could then rename a root-owned `openqtt` folder aside and
+put their own `device` where the plist looks: a root shell for anyone with
+that account. `/Library/Application Support` is root's on every Mac. Check the
+chain once after installing; every line should say `root`:
+
+```sh
+for d in / /Library "/Library/Application Support" "/Library/Application Support/OpenQTT" "/Library/Application Support/OpenQTT/bin"; do stat -f "%Su %Sp %N" "$d"; done
+```
+
 ```sh
 sudo install -d -m 700 "/Library/Application Support/OpenQTT"
 sudo install -m 644 root.pem artifact-key.pem "/Library/Application Support/OpenQTT/"
-sudo install -d -m 755 /usr/local/libexec/openqtt /Library/Logs/OpenQTT
-sudo install -m 755 device /usr/local/libexec/openqtt/device
+sudo install -d -m 755 "/Library/Application Support/OpenQTT/bin" /Library/Logs/OpenQTT
+sudo install -m 755 device "/Library/Application Support/OpenQTT/bin/device"
 ```
 
 **A binary a browser downloaded will not run.** The browser marks it with
@@ -612,7 +624,7 @@ build with `curl`, which does not set it.
 The first run is the one worth watching, so it is made from a Terminal:
 
 ```sh
-sudo env OPENQTT_DEVICE=acme/production/pump-3 OPENQTT_TOKEN=oqe_... /usr/local/libexec/openqtt/device
+sudo env OPENQTT_DEVICE=acme/production/pump-3 OPENQTT_TOKEN=oqe_... "/Library/Application Support/OpenQTT/bin/device"
 ```
 
 `sudo env` because sudo does not pass the caller's variables through. Stop it
@@ -631,7 +643,7 @@ The plist, as `com.openqtt.device.plist`:
     <string>com.openqtt.device</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/libexec/openqtt/device</string>
+        <string>/Library/Application Support/OpenQTT/bin/device</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
