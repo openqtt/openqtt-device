@@ -26,6 +26,7 @@
 
 use std::error::Error;
 use std::ffi::OsString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -49,6 +50,12 @@ type Main = Box<dyn FnOnce(Stop) -> Result<(), Box<dyn Error>> + Send>;
 /// [`run`] to `service_main`. The SCM calls that on a thread of its own and
 /// offers no way to pass it anything.
 static PENDING: Mutex<Option<(String, Main)>> = Mutex::new(None);
+
+/// Set once the dispatcher has said this process was started by hand. That
+/// cannot change for the life of the process, and asking again does not get
+/// the same answer: a second `StartServiceCtrlDispatcher` in one process fails
+/// with a different error, so a later [`run`] skips it.
+static BY_HAND: AtomicBool = AtomicBool::new(false);
 
 windows_service::define_windows_service!(ffi_service_main, service_main);
 
@@ -111,21 +118,33 @@ pub fn run<F>(name: &str, main: F) -> Result<(), Box<dyn Error>>
 where
     F: FnOnce(Stop) -> Result<(), Box<dyn Error>> + Send + 'static,
 {
+    if BY_HAND.load(Ordering::SeqCst) {
+        return by_hand(Box::new(main));
+    }
     *pending() = Some((name.to_string(), Box::new(main)));
     match service_dispatcher::start(name, ffi_service_main) {
         Ok(()) => Ok(()),
         Err(windows_service::Error::Winapi(error))
             if error.raw_os_error() == Some(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) =>
         {
+            BY_HAND.store(true, Ordering::SeqCst);
             let (_, main) = pending()
                 .take()
                 .ok_or("the service's main has already been run")?;
-            // Held until `main` returns. Dropped, it would read as a stop.
-            let (_asking, stop) = channel();
-            main(stop)
+            by_hand(main)
         }
-        Err(error) => Err(Box::new(error)),
+        Err(error) => {
+            pending().take();
+            Err(describe(&error).into())
+        }
     }
+}
+
+/// `main` as an ordinary program, with a stop that never comes.
+fn by_hand(main: Main) -> Result<(), Box<dyn Error>> {
+    // Held until `main` returns. Dropped, it would read as a stop.
+    let (_asking, stop) = channel();
+    main(stop)
 }
 
 fn pending() -> MutexGuard<'static, Option<(String, Main)>> {
