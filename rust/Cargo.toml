@@ -57,6 +57,22 @@ rand = "0.9"
 thiserror = "2"
 tracing = "0.1"
 
+# THE SERVICE CONTROL MANAGER, and only for a device that asks. A Windows
+# program the SCM starts has to call `StartServiceCtrlDispatcher` within
+# about thirty seconds or it is killed, so a device that updates itself as a
+# service needs this conversation, and it is FFI that `forbid(unsafe_code)`
+# keeps out of this crate. Mullvad's crate holds the unsafe and is the one in
+# wide use. Microsoft's `windows-services` reports every stop as a success,
+# which would hide a device that stopped on an error from the recovery action
+# that restarts it. This adds itself and `widestring` to the tree: its
+# `windows-sys` is the one tokio already brings.
+[target.'cfg(windows)'.dependencies]
+windows-service = { version = "0.8.1", optional = true }
+
+[features]
+# `openqtt_device::service`, on Windows. Nothing anywhere else.
+windows-service = ["dep:windows-service"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 # rumqttc's own channel type, so `AsyncClient::from_senders` can hand a test
@@ -71,12 +87,25 @@ tempfile = "3"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs", "x509-parser"] }  # x509-parser: the test mock signs the device's real CSR
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# `publish`, run as a Windows service.
+[[example]]
+name = "windows_service"
+required-features = ["windows-service"]
+
 # What Windows does to a running `.exe`, which the swap and the rollback are
 # built on. A program rather than a test function, because it runs a copy of
 # itself to have a running `.exe` to try things on.
 [[test]]
 name = "running_binary"
 harness = false
+
+# `service::run` run by hand, every time. And a real service, registered and
+# started, to prove exit 73 restarts it: opt in with OPENQTT_SCM_TEST=1 from
+# an elevated prompt, which CI does.
+[[test]]
+name = "service_manager"
+harness = false
+required-features = ["windows-service"]
 
 # Only applies when this package is the root, which means the example and
 # anything built out of this repository. A device image is the target: small

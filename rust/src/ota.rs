@@ -15,6 +15,21 @@
 //! that 73 is success, so it does not restart at all, and the service is dead
 //! after every successful update until somebody starts it by hand.
 //!
+//! # The service, on Windows
+//!
+//! ```text
+//! sc.exe failure <service> reset= 0 actions= restart/2000
+//! sc.exe failureflag <service> 1
+//! ```
+//!
+//! The same exit, and the same need for something to follow it. The service
+//! control manager counts a process that ends without reporting that it
+//! stopped as a failure, whatever its code, which is exactly what exiting 73
+//! looks like from there. A failure restarts the service only when a recovery
+//! action says so, and by default none does. The second line covers a service
+//! that reports a stop with an error instead. The binary also has to be one the
+//! SCM can host at all, which a plain program is not: see `crate::service`.
+//!
 //! # Where things are written
 //!
 //! IN THE DIRECTORY THE RUNNING BINARY IS IN, and nowhere else. Two separate
@@ -1166,7 +1181,8 @@ async fn farewell(publisher: &Publisher, flushed: &Notify, version: &str) {
 }
 
 /// Hand the process back to the service manager. See this module's header for
-/// the two lines the unit file needs.
+/// the two lines the unit file needs, and the two settings a Windows service
+/// needs.
 fn restart() -> ! {
     tracing::warn!(
         code = RESTART,
