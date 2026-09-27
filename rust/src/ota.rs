@@ -2908,4 +2908,59 @@ yp3pqun9aUO9CpufgZkRA9Rf9OuZHwqLxAK+KcLrF+kjRm9hCqbAYgyG6w==\n\
             "and the link is left naming it"
         );
     }
+
+    /// ARM64 MACOS STARTS NOTHING UNSIGNED, and an update is a binary this
+    /// device wrote itself. Three things make that work, and this checks them
+    /// on a real executable, this test binary, sent through the download and
+    /// the renames an update uses: the linker signs every arm64 build ad hoc,
+    /// the signature is inside the Mach-O and so arrives with the bytes, and a
+    /// file the device wrote itself carries no quarantine mark, which gets an
+    /// ad hoc signed binary killed as it starts.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn on_macos_a_signed_binary_downloaded_and_renamed_into_place_starts() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let this = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let mut bench = Bench::with_artifact(this).await;
+        // The mode an update copies onto the download, as a real binary has.
+        std::fs::set_permissions(&bench.paths.binary, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let (publisher, _sent) = spy::publisher();
+        let announced = bench.announcement();
+        assert_eq!(
+            bench.updater.install(&publisher, &announced).await.unwrap(),
+            Next::Restart {
+                into: "1.4.0".to_string()
+            }
+        );
+
+        let attributes = std::process::Command::new("xattr")
+            .arg(&bench.paths.binary)
+            .output()
+            .unwrap();
+        assert!(attributes.status.success(), "{attributes:?}");
+        let attributes = String::from_utf8_lossy(&attributes.stdout);
+        assert!(!attributes.contains("com.apple.quarantine"), "{attributes}");
+
+        // What the service manager does after the exit: start whatever is at
+        // the path. `--list` makes this test binary name its tests and stop,
+        // which it can only do once the kernel has let it start. A signature
+        // the kernel refused would be SIGKILL, before a line was printed.
+        let started = std::process::Command::new(&bench.paths.binary)
+            .args(["--list", "on_macos_a_signed_binary"])
+            .output()
+            .unwrap();
+        assert!(
+            started.status.success(),
+            "{:?}: {}",
+            started.status,
+            String::from_utf8_lossy(&started.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&started.stdout)
+                .contains("on_macos_a_signed_binary_downloaded_and_renamed_into_place_starts"),
+            "{}",
+            String::from_utf8_lossy(&started.stdout)
+        );
+    }
 }
